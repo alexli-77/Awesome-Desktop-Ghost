@@ -25,14 +25,15 @@ Multiple windows can be ghosted at different levels.
 
 ## Install
 
-Download `Ghost.app.zip` from the [latest release](../../releases/latest), unzip, move `Ghost.app` wherever you like and open it.
+1. Download `Ghost.app.zip` from the [latest release](../../releases/latest) and unzip it.
+2. Drag `Ghost.app` into `/Applications` (optional) and double-click it. It lives in the menu bar as 👻 — no Dock icon.
+3. First launch asks for **Screen Recording**: turn Ghost on in *System Settings → Privacy & Security → Screen Recording*, then quit Ghost (👻 → 退出) and open it again.
+4. Optional: 👻 → **登录时自动启动** to have it start at login.
 
-First launch: macOS asks for **Screen Recording**. Enable Ghost in *System Settings → Privacy & Security → Screen Recording*, then quit and relaunch Ghost.
-
-The app is ad-hoc signed (no Apple developer certificate). If macOS refuses to open it, right-click → Open once, or run:
+The app is ad-hoc signed (no paid Apple developer certificate), so the first double-click may be blocked with "cannot be opened because the developer cannot be verified". Either right-click → **Open** → Open, or clear the quarantine flag once:
 
 ```bash
-xattr -dr com.apple.quarantine Ghost.app
+xattr -dr com.apple.quarantine /Applications/Ghost.app
 ```
 
 ## Build from source

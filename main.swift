@@ -18,6 +18,7 @@
 import AppKit
 import Carbon
 import ScreenCaptureKit
+import ServiceManagement
 
 // MARK: - Window enumeration
 
@@ -503,6 +504,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(withTitle: "全部恢复 (\(ghosts.count))", action: #selector(restoreAllAction), keyEquivalent: "")
         }
 
+        let login = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        menu.addItem(login)
+
         menu.addItem(.separator())
         let head = NSMenuItem(title: "窗口（点击 = 切换）", action: nil, keyEquivalent: "")
         head.isEnabled = false
@@ -530,6 +535,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func restoreAllAction() { restoreAll() }
+
+    @objc private func toggleLoginItem() {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            showError("设置登录启动失败：\(error.localizedDescription)")
+        }
+    }
 
     // MARK: global hotkey (⌃⌥T) via Carbon
 

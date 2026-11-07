@@ -20,6 +20,15 @@ jobs:
           APP=Ghost.app
           mkdir -p "$APP/Contents/MacOS"
           cp Info.plist "$APP/Contents/"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(tr -d '[:space:]' < VERSION)" "$APP/Contents/Info.plist"
+          # App icon: PNG → .icns (iconutil is macOS-only)
+          ICONSET=$(mktemp -d)/Ghost.iconset
+          mkdir -p "$ICONSET" "$APP/Contents/Resources"
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz assets/icon_1024.png --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+            sips -z $((sz*2)) $((sz*2)) assets/icon_1024.png --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Ghost.icns"
           swiftc -O -target arm64-apple-macos13.0  -o Ghost-arm64  main.swift
           swiftc -O -target x86_64-apple-macos13.0 -o Ghost-x86_64 main.swift
           lipo -create Ghost-arm64 Ghost-x86_64 -output "$APP/Contents/MacOS/Ghost"

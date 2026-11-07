@@ -8,6 +8,15 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp Info.plist "$APP/Contents/"
 
+# App icon: PNG → .icns (iconutil is macOS-only)
+ICONSET=$(mktemp -d)/Ghost.iconset
+mkdir -p "$ICONSET" "$APP/Contents/Resources"
+for sz in 16 32 128 256 512; do
+  sips -z $sz $sz assets/icon_1024.png --out "$ICONSET/icon_${sz}x${sz}.png" >/dev/null
+  sips -z $((sz*2)) $((sz*2)) assets/icon_1024.png --out "$ICONSET/icon_${sz}x${sz}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Ghost.icns"
+
 swiftc -O \
   -target "$(uname -m)-apple-macos13.0" \
   -framework AppKit -framework ScreenCaptureKit -framework Carbon \
