@@ -41,8 +41,8 @@ xattr -dr com.apple.quarantine /Applications/Ghost.app
 Requires macOS 13+ and Xcode or the Command Line Tools.
 
 ```bash
-git clone https://github.com/alexli-77/Ghost.git
-cd Ghost
+git clone https://github.com/alexli-77/Awesome-Desktop-Ghost.git
+cd Awesome-Desktop-Ghost
 ./build.sh      # produces Ghost.app
 open Ghost.app
 ```
