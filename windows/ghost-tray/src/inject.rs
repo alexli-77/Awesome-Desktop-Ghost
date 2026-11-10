@@ -6,7 +6,8 @@ use std::mem::size_of;
 use std::path::PathBuf;
 
 use windows::core::{s, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, VirtualAllocEx, VirtualFreeEx,
@@ -15,7 +16,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::System::Threading::{
     CreateEventW, CreateRemoteThread, IsWow64Process, OpenProcess, ResetEvent, WaitForSingleObject,
     LPTHREAD_START_ROUTINE, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
-    PROCESS_VM_READ, PROCESS_VM_WRITE, WAIT_OBJECT_0,
+    PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
 // WDA_* values from winuser.h.
@@ -128,15 +129,7 @@ unsafe fn set_affinity_inner(pid: u32, hwnd: isize, affinity: u32) -> Result<(),
         cleanup(Some((proc, std::ptr::null_mut(), 0)));
         return Err("在目标进程分配内存失败".into());
     }
-    if windows::Win32::System::Memory::WriteProcessMemory(
-        proc,
-        remote,
-        path.as_ptr() as *const _,
-        bytes,
-        None,
-    )
-    .is_err()
-    {
+    if WriteProcessMemory(proc, remote, path.as_ptr() as *const _, bytes, None).is_err() {
         cleanup(Some((proc, remote, bytes)));
         return Err("写入目标进程失败".into());
     }

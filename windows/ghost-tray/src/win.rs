@@ -118,8 +118,8 @@ pub fn set_alpha(hwnd: isize, percent: u8) -> Result<bool, String> {
         let alpha = ((percent as u32 * 255) / 100) as u8;
         SetLayeredWindowAttributes(h, COLORREF(0), alpha, LWA_ALPHA)
             .map_err(|_| uipi_hint())?;
+        Ok(added)
     }
-    Ok(added)
 }
 
 /// Undo `set_alpha`. If we added WS_EX_LAYERED, remove it; otherwise the window

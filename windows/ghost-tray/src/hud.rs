@@ -7,9 +7,10 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateRoundRectRgn, CreateSolidBrush, DeleteObject, Ellipse, EndPaint, FillRect,
-    GetStockObject, Rectangle, SelectObject, SetBkMode, SetTextColor, TextOutW, DEFAULT_GUI_FONT,
-    HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    GetStockObject, InvalidateRect, Rectangle, SelectObject, SetBkMode, SetTextColor, SetWindowRgn,
+    TextOutW, DEFAULT_GUI_FONT, HDC, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{set_opacity, with_app};
