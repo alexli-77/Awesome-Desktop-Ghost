@@ -23,6 +23,25 @@ Visually the target looks transparent — you see what is behind it. Clicks pass
 
 Multiple windows can be ghosted at different levels.
 
+### Hide from screen sharing
+
+Menu bar **👻 → 共享/录屏时隐藏** switches modes: ghosted windows stay visible to you at their opacity, but disappear from screen sharing, recordings and screenshots (Zoom, Meet, Teams, Cap, QuickTime, ⇧⌘3 …). Everyone else sees what is behind the window.
+
+How: while a window is hidden, Ghost covers each display with a full-screen capture of the screen *without* that app, which only captures see, and shows you a second, local-only capture of the real screen on top, with the hidden window blended in. Because the cover is full-screen, dragging, jumping, minimizing or switching Spaces can't uncover the window. A hidden app's menus, sheets and popovers are left out from their first frame; its unrelated windows stay visible to viewers (a newly opened one may appear a moment late). The cursor is hidden from captures while it's over a hidden window.
+
+**Which sharing tools it works with.** Hiding relies on the capture tool honouring macOS's "don't capture this window" flag, which everything built on ScreenCaptureKit does:
+
+- verified: Chrome's screen sharing (`getDisplayMedia`, what Google Meet, Zoom / Teams / Feishu in the browser use), the macOS screenshot and recording tools (⇧⌘3, ⇧⌘5), Cap;
+- **not** honoured: Feishu / Lark's desktop screen recorder, which grabs the raw screen — it records exactly what you see, so nothing can be hidden from it. Other native meeting apps may do the same; test before relying on them (share your screen and check what the other side sees).
+
+If Ghost crashes or is force-quit, a watchdog process that keeps opaque blocks under the hidden windows takes over at once and relaunches Ghost, which covers them again.
+
+Trade-offs while something is hidden:
+
+- your whole screen is shown through a capture, about one display frame late, and the window server works noticeably harder (≈ half a CPU core on an M-series Mac);
+- DRM-protected video (Netflix, Apple TV) can't be captured, so it may show black to you as well;
+- quitting Ghost from the menu warns you first: hidden windows reappear in shares once it's gone.
+
 ## Install
 
 1. Download `Ghost.app.zip` from the [latest release](../../releases/latest) and unzip it.
@@ -53,7 +72,7 @@ open /Applications/Ghost.app
 
 - The ghost effect shows up in screen recordings (Cap, QuickTime, …); the opacity slider does not.
 - Overlays live at the floating window level, so a normal window dragged *over* a ghosted window is slightly dimmed in the overlapping area.
-- Full-screen apps and Stage Manager are untested.
+- Full-screen apps and Stage Manager are untested; hide mode is untested on multiple displays.
 - Cost is roughly one 30 fps screen recording per display in use; negligible on Apple silicon.
 
 ## License

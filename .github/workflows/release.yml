@@ -32,6 +32,7 @@ jobs:
           swiftc -O -target arm64-apple-macos13.0  -o Ghost-arm64  main.swift
           swiftc -O -target x86_64-apple-macos13.0 -o Ghost-x86_64 main.swift
           lipo -create Ghost-arm64 Ghost-x86_64 -output "$APP/Contents/MacOS/Ghost"
+          ln -s Ghost "$APP/Contents/MacOS/Ghost Watchdog"
           codesign --force --identifier com.yangli.ghost --sign - "$APP"
           ditto -c -k --keepParent "$APP" Ghost.app.zip
           shasum -a 256 Ghost.app.zip > Ghost.app.zip.sha256
