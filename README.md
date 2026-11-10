@@ -43,14 +43,15 @@ Requires macOS 13+ and Xcode or the Command Line Tools.
 ```bash
 git clone https://github.com/alexli-77/Awesome-Desktop-Ghost.git
 cd Awesome-Desktop-Ghost
-./build.sh      # produces Ghost.app
-open Ghost.app
+./build.sh      # builds Ghost.app and installs it to /Applications
+open /Applications/Ghost.app
 ```
 
 `build.sh` also resets the stale Screen Recording grant (`tccutil reset ScreenCapture com.yangli.ghost`), because an ad-hoc signature changes on every build and macOS forgets the previous permission.
 
 ## Limitations
 
+- The ghost effect shows up in screen recordings (Cap, QuickTime, …); the opacity slider does not.
 - Overlays live at the floating window level, so a normal window dragged *over* a ghosted window is slightly dimmed in the overlapping area.
 - Full-screen apps and Stage Manager are untested.
 - Cost is roughly one 30 fps screen recording per display in use; negligible on Apple silicon.

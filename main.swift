@@ -75,6 +75,8 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
     let targetID: CGWindowID
     var onEnded: (() -> Void)?
     var onError: ((String) -> Void)?
+    /// Fires once this ghost's overlay is on screen and its stream is running.
+    var onStarted: (() -> Void)?
 
     /// 0…1, how opaque the target should *look*.
     var opacity: CGFloat { didSet { overlay.alphaValue = 1 - opacity } }
@@ -86,6 +88,7 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
     // background can never be offset from where it should be — no jitter while
     // dragging/resizing, and no round-trips to the capture engine.
     private let overlay: NSWindow
+    private let overlayID: CGWindowID          // read off the main thread, so cache it
     private let patch = CALayer()
     private let config = SCStreamConfiguration()
     private let frameQueue = DispatchQueue(label: "ghost.frames")
@@ -93,6 +96,7 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
     private var timer: Timer?
     private var lastBounds = CGRect.null
     private var displayFrame = CGRect.zero     // CG coords
+    private var display: SCDisplay?
     private var restarting = false
 
     init(targetID: CGWindowID, opacity: CGFloat) {
@@ -105,7 +109,9 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
         overlay.hasShadow = false
         overlay.ignoresMouseEvents = true          // clicks go to the real window underneath
         overlay.level = .floating
-        overlay.sharingType = .none                // never capture ourselves
+        // Visible to other recorders (Cap, QuickTime…) so demos show the effect.
+        // Our own streams exclude every Ghost window explicitly instead.
+        overlay.sharingType = .readOnly
         overlay.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
         overlay.alphaValue = 1 - opacity
         let v = NSView(frame: .zero)
@@ -114,6 +120,7 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
         patch.actions = ["contents": NSNull(), "contentsRect": NSNull(), "bounds": NSNull(), "position": NSNull()]
         v.layer?.addSublayer(patch)
         overlay.contentView = v
+        overlayID = CGWindowID(overlay.windowNumber)
         super.init()
     }
 
@@ -145,19 +152,26 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func startStream(bounds: CGRect) async {
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-            guard let target = content.windows.first(where: { $0.windowID == targetID }) else {
+            let first = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard first.windows.contains(where: { $0.windowID == targetID }) else {
                 fail("ScreenCaptureKit 找不到目标窗口 \(targetID)"); return
             }
             let center = CGPoint(x: bounds.midX, y: bounds.midY)
-            guard let display = content.displays.first(where: { $0.frame.contains(center) }) ?? content.displays.first
+            guard let display = first.displays.first(where: { $0.frame.contains(center) }) ?? first.displays.first
             else { fail("没有可用的显示器"); return }
 
-            var excluded = [target]
-            if let ov = content.windows.first(where: { $0.windowID == CGWindowID(overlay.windowNumber) }) {
-                excluded.append(ov)
+            // Show the overlay (still empty, so invisible) BEFORE building the filter:
+            // only an on-screen overlay is guaranteed to be listed and excludable.
+            await MainActor.run {
+                self.display = display
+                displayFrame = display.frame
+                overlay.setFrame(cocoaRect(display.frame), display: false)
+                lastBounds = .null
+                placePatch(bounds)
+                overlay.orderFrontRegardless()
             }
-            let filter = SCContentFilter(display: display, excludingWindows: excluded)
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            let filter = SCContentFilter(display: display, excludingWindows: excludedWindows(in: content))
 
             let screen = NSScreen.screens.first {
                 ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID
@@ -171,20 +185,34 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
             config.width = Int(CGFloat(display.width) * scale)
             config.height = Int(CGFloat(display.height) * scale)
 
-            await MainActor.run {
-                displayFrame = display.frame
-                overlay.setFrame(cocoaRect(display.frame), display: false)
-                lastBounds = .null
-                placePatch(bounds)
-                overlay.orderFrontRegardless()
-            }
-
             let s = SCStream(filter: filter, configuration: config, delegate: self)
             try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameQueue)
             try await s.startCapture()
             stream = s
+            await MainActor.run { onStarted?() }
         } catch {
             fail("启动捕获失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// The target plus every window Ghost owns (all overlays), so no stream ever
+    /// captures an overlay — otherwise the image would feed back into itself.
+    private func excludedWindows(in content: SCShareableContent) -> [SCWindow] {
+        let me = ProcessInfo.processInfo.processIdentifier
+        if !content.windows.contains(where: { $0.windowID == overlayID }) {
+            NSLog("Ghost: overlay \(overlayID) not in shareable content; stream may capture it")
+        }
+        return content.windows.filter { $0.windowID == targetID || $0.owningApplication?.processID == me }
+    }
+
+    /// Re-exclude Ghost's windows; call when another ghost's overlay appears.
+    func refreshFilter() {
+        guard let s = stream, let display else { return }
+        Task {
+            guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            else { return }
+            let filter = SCContentFilter(display: display, excludingWindows: excludedWindows(in: content))
+            do { try await s.updateContentFilter(filter) } catch { NSLog("Ghost: updateContentFilter failed: \(error)") }
         }
     }
 
@@ -329,7 +357,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let titleBarHeight: CGFloat = 32
 
     func applicationDidFinishLaunching(_: Notification) {
+        // New status items are placed at the far left of the menu bar, which on a
+        // notched MacBook with a full bar means hidden behind the notch. Ask for a
+        // spot near the right edge (points from the right) on first launch; a later
+        // ⌘-drag by the user overwrites this key and is kept.
+        let posKey = "NSStatusItem Preferred Position GhostStatusItem"
+        if UserDefaults.standard.object(forKey: posKey) == nil {
+            UserDefaults.standard.set(400, forKey: posKey)
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.autosaveName = "GhostStatusItem"
         statusItem.button?.title = "👻"
         menu.delegate = self
         statusItem.menu = menu
@@ -405,6 +442,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.ghosts[id] = nil
             }
             g.onError = { [weak self] msg in self?.hideHUD(); self?.showError(msg) }
+            g.onStarted = { [weak self, weak g] in   // new overlay → hide it from the other streams
+                self?.ghosts.values.forEach { if $0 !== g { $0.refreshFilter() } }
+            }
             ghosts[id] = g
             g.start()
         }

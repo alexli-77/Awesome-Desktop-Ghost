@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build Ghost.app next to this script. Needs Xcode or Command Line Tools.
+# Build Ghost.app next to this script and install it to /Applications.
+# Needs Xcode or Command Line Tools.
 set -e
 cd "$(dirname "$0")"
 
@@ -29,7 +30,12 @@ codesign --force --identifier com.yangli.ghost --sign - "$APP"
 pkill -x Ghost 2>/dev/null || true
 tccutil reset ScreenCapture com.yangli.ghost >/dev/null 2>&1 || true
 
-echo "Built $APP"
-echo "Run:  open $APP"
+# Install, replacing the old copy, so /Applications never runs a stale build.
+DEST=/Applications/Ghost.app
+rm -rf "$DEST"
+ditto "$APP" "$DEST"
+
+echo "Built $APP and installed to $DEST"
+echo "Run:  open $DEST"
 echo "Then: System Settings > Privacy & Security > Screen Recording → turn on Ghost → relaunch."
-echo "Debug: run $APP/Contents/MacOS/Ghost from a terminal to see log output."
+echo "Debug: run $DEST/Contents/MacOS/Ghost from a terminal to see log output."
