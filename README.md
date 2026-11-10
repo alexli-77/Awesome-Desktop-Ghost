@@ -78,6 +78,43 @@ open /Applications/Ghost.app
 - Full-screen apps and Stage Manager are untested; hide mode is untested on multiple displays.
 - Cost is roughly one 30 fps screen recording per display in use; negligible on Apple silicon.
 
+## Windows
+
+A native Windows port lives in [`windows/`](windows/). It does **not** use the screen-capture-and-overlay trick the macOS build needs — Windows exposes the APIs directly:
+
+- **Transparency** via layered windows (`WS_EX_LAYERED` + `SetLayeredWindowAttributes`), so the real window becomes see-through; no capture, no overlay.
+- **Hide from screen sharing** via `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`. That call only affects the calling process's own windows, so Ghost injects a tiny helper DLL (`ghost_inject.dll`) into the target, which applies the flag and then unloads itself.
+
+Same interactions as macOS: hover a title bar ~0.3 s for the opacity slider (20 %–100 %, 100 % restores), **Ctrl+Alt+T** toggles the foreground window, and a tray icon 👻 lists windows, sets the default opacity, toggles hide-from-capture, restores all, and runs at login.
+
+### Install (Windows)
+
+1. Download `Ghost-Windows.zip` from the [latest release](../../releases/latest) and unzip it. Use the `x64` folder on Intel/AMD, `arm64` on ARM PCs.
+2. Keep `Ghost.exe` and `ghost_inject.dll` **in the same folder** — hide-from-capture needs the DLL beside the exe.
+3. Run `Ghost.exe`. It lives in the tray (👻); there is no window.
+
+The build is **not code-signed** (no paid certificate), so SmartScreen shows "Windows protected your PC" on first run — click **More info → Run anyway**.
+
+### Build (Windows)
+
+Requires the Rust toolchain and the MSVC build tools.
+
+```powershell
+cd windows
+cargo build --release --target x86_64-pc-windows-msvc
+```
+
+Output: `target\x86_64-pc-windows-msvc\release\Ghost.exe` and `ghost_inject.dll`.
+
+### Windows limitations and verification status
+
+The Windows code so far is **CI-verified to compile only**. The behaviours below need testing on real hardware (none of the maintainers' machines in this build run Windows); see the port's PR for the live checklist.
+
+- Hide-from-capture relies on DLL injection, so it **cannot** touch elevated/protected processes unless Ghost runs as administrator, may be blocked by antivirus, and does not support 32-bit target apps.
+- Modifying another window's styles fails for UIPI-protected (elevated) or UWP/Store windows; Ghost reports this instead of failing silently.
+- The title-bar hover region is approximated as the top ~42 px of a window, so apps with tall custom title bars may trigger the slider imprecisely.
+- Feishu/Lark's desktop recorder ignores capture-exclusion on macOS; the same is expected on Windows and is untested.
+
 ## License
 
 MIT
