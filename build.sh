@@ -22,11 +22,13 @@ swiftc -O \
   -target "$(uname -m)-apple-macos13.0" \
   -framework AppKit -framework ScreenCaptureKit -framework Carbon \
   -o "$APP/Contents/MacOS/Ghost" main.swift
+ln -s Ghost "$APP/Contents/MacOS/Ghost Watchdog"   # names the watchdog process
 
 # Ad-hoc sign with a fixed identifier. NOTE: an ad-hoc signature's hash changes
 # on every build, so macOS forgets the old Screen Recording grant. Clear the
 # stale entry so the next launch asks cleanly instead of silently failing.
 codesign --force --identifier com.yangli.ghost --sign - "$APP"
+pkill -x "Ghost Watchdog" 2>/dev/null || true   # first, so it doesn't react to Ghost quitting
 pkill -x Ghost 2>/dev/null || true
 tccutil reset ScreenCapture com.yangli.ghost >/dev/null 2>&1 || true
 

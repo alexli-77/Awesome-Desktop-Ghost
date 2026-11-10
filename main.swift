@@ -450,7 +450,7 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
 
     let coverWin: NSWindow
     let viewWin: NSWindow
-    private let coverID: CGWindowID            // read off the main thread, so cached
+    let coverID: CGWindowID                    // read off the main thread, so cached
     private let coverRoot: CALayer
     private let viewRoot: CALayer
     private let coverBase = CALayer()
@@ -478,9 +478,12 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
             let keep = content.windows.filter { keys.contains(UInt64($0.windowID)) }
             return SCContentFilter(display: d, excludingApplications: apps, exceptingWindows: keep)
         }
-        view = ShieldStream(name: "view") { content, _ in
+        // Ghost's own menus and alerts sit below the overlays; let them into the
+        // view (keys: their window ids) or you couldn't see them while hiding.
+        view = ShieldStream(name: "view") { content, keys in
             let apps = content.applications.filter { $0.processID == me || $0.processID == watchdogPID }
-            return SCContentFilter(display: d, excludingApplications: apps, exceptingWindows: [])
+            let mine = content.windows.filter { keys.contains(UInt64($0.windowID)) }
+            return SCContentFilter(display: d, excludingApplications: apps, exceptingWindows: mine)
         }
         let full = CGRect(origin: .zero, size: f.size)
         for (l, root) in [(coverBase, coverRoot), (viewBase, viewRoot)] {
@@ -517,6 +520,7 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func want(_ keys: Set<UInt64>) { base.want(keys) }
+    func wantInView(_ keys: Set<UInt64>) { view.want(keys) }
 
     /// The cover is up and known to leave this app's hidden windows out.
     func isReady(pid: pid_t) -> Bool {
@@ -874,6 +878,7 @@ final class ShareShield {
                         self.restartShield(id)
                     }
                     shields[id] = s
+                    s.wantInView(ownWindows)
                     s.start(keys: keys)
                 }
                 layoutAll()
@@ -889,6 +894,7 @@ final class ShareShield {
             guard let self, let fresh, self.shields[id] === fresh else { return }
             self.restartShield(id)
         }
+        fresh.wantInView(ownWindows)
         fresh.start(keys: keys)
         var check: Timer?
         check = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
@@ -907,6 +913,17 @@ final class ShareShield {
     private var related: [CGWindowID: Set<CGWindowID>] = [:]
     /// Every on-screen window of a hidden app → the hidden window it belongs to (nil: unrelated).
     private var known: [CGWindowID: CGWindowID?] = [:]
+    /// Ghost's own menus and alerts, shown in the local view.
+    private var ownWindows: Set<UInt64> = []
+
+    /// Look again right away, e.g. when Ghost's menu is about to open.
+    func rescanSoon() {
+        guard timer != nil else { return }
+        for delay in [0.02, 0.06] {
+            let t = Timer(timeInterval: delay, repeats: false) { [weak self] _ in self?.scan() }
+            RunLoop.main.add(t, forMode: .common)
+        }
+    }
 
     /// 120 Hz: follow the hidden windows and their children, looked up by id.
     private func tick() {
@@ -943,6 +960,17 @@ final class ShareShield {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return }
         var wins: [CGWindowID: (pid: pid_t, layer: Int, bounds: CGRect, z: Int, titled: Bool)] = [:]
         let watched = pids
+        let me = ProcessInfo.processInfo.processIdentifier
+        var mine: Set<UInt64> = []
+        for d in list where (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == me {
+            if let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value { mine.insert(UInt64(id)) }
+        }
+        // Everything of ours but the covers (the rest is .none, never captured anyway).
+        mine.subtract(shields.values.map { UInt64($0.coverID) })
+        if mine != ownWindows {
+            ownWindows = mine
+            shields.values.forEach { $0.wantInView(mine) }
+        }
         for (z, d) in list.enumerated() {                // front to back
             guard let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, watched.contains(pid),
                   let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
@@ -1050,7 +1078,11 @@ enum CrashGuard {
                 raise(s)
             }
         }
-        guard let exe = Bundle.main.executablePath else { return }
+        guard var exe = Bundle.main.executablePath else { return }
+        // Through a link named "Ghost Watchdog" (made by build.sh), so Activity
+        // Monitor doesn't list two processes both called Ghost.
+        let link = (exe as NSString).deletingLastPathComponent + "/Ghost Watchdog"
+        if FileManager.default.isExecutableFile(atPath: link) { exe = link }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: exe)
         p.arguments = ["--watchdog", String(getpid())]
@@ -1362,6 +1394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.messageText = "Ghost 出错了"
         a.informativeText = msg
         NSApp.activate(ignoringOtherApps: true)
+        shield.rescanSoon()                    // show the alert in the local view while hiding
         a.runModal()
     }
 
@@ -1374,6 +1407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.addButton(withTitle: "取消")
         a.addButton(withTitle: "仍然退出")
         NSApp.activate(ignoringOtherApps: true)
+        shield.rescanSoon()
         return a.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
     }
 
@@ -1512,6 +1546,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: menu
+
+    func menuWillOpen(_ menu: NSMenu) { shield.rescanSoon() }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
