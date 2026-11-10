@@ -30,6 +30,7 @@
   .btn.primary { background: #fff; color: var(--indigo); box-shadow: 0 8px 24px rgba(0,0,0,.25); }
   .btn.ghost { border: 1.5px solid rgba(255,255,255,.55); color: #fff; }
   .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .beta { font-size: 11px; font-weight: 700; letter-spacing: .5px; padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,.22); border: 1px solid rgba(255,255,255,.4); }
   .meta { margin-top: 14px; font-size: 14px; opacity: .8; }
 
   /* demo */
@@ -92,6 +93,9 @@
     <div class="cta">
       <a class="btn primary" id="dl" href="https://github.com/alexli-77/Awesome-Desktop-Ghost/releases/latest/download/Ghost.app.zip">
         下载 macOS 版
+      </a>
+      <a class="btn ghost" href="https://github.com/alexli-77/Awesome-Desktop-Ghost/releases/latest/download/Ghost-Windows.zip">
+        下载 Windows 版 <span class="beta">Beta</span>
       </a>
       <a class="btn ghost" href="https://github.com/alexli-77/Awesome-Desktop-Ghost">GitHub 源码</a>
     </div>
@@ -176,6 +180,27 @@
   </div>
 </section>
 
+<section id="windows">
+  <div class="wrap">
+    <h2>Windows 版 <span class="beta" style="background:#fff3cd;border-color:#f1e3a1;color:#9a6700;vertical-align:middle">Beta</span></h2>
+    <p class="lead">原生 Windows 移植版，交互和 macOS 版一致：悬停标题栏出滑块、<code>Ctrl+Alt+T</code> 一键切换、托盘 👻 管理所有窗口。目前是实验版——已通过 CI 编译，但<b>还没在真机上逐项验证</b>，请当早期测试版用。</p>
+    <div class="grid3">
+      <div class="card"><div class="ic">🪟</div><h3>直接改真窗口</h3>
+        <p>用系统的分层窗口 API（<code>WS_EX_LAYERED</code>）让窗口半透明，不像 macOS 版那样靠截屏叠层，开销更小。</p></div>
+      <div class="card"><div class="ic">🙈</div><h3>共享时隐藏</h3>
+        <p>用 <code>SetWindowDisplayAffinity</code> 把窗口排除出截屏。该调用只作用于自己进程，所以 Ghost 会往目标进程注入一个用完即卸载的小 DLL。</p></div>
+      <div class="card"><div class="ic">⚠️</div><h3>已知限制</h3>
+        <p>注入对提权/受保护进程无效（除非以管理员运行），可能被杀毒拦截，不支持 32 位程序；飞书桌面端抓原始屏幕，隐藏不了。</p></div>
+    </div>
+    <ol class="steps">
+      <li>点上面的「下载 Windows 版」，解压。Intel/AMD 电脑用 <code>x64</code> 文件夹，ARM 电脑用 <code>arm64</code>。</li>
+      <li>把 <code>Ghost.exe</code> 和 <code>ghost_inject.dll</code> <b>放在同一个文件夹</b>——共享隐藏需要 DLL 在 exe 旁边。</li>
+      <li>运行 <code>Ghost.exe</code>。没有代码签名，SmartScreen 会提示「Windows 已保护你的电脑」，点<b>「更多信息 → 仍要运行」</b>。它住在托盘 👻，没有窗口。</li>
+    </ol>
+    <p class="note">逐项验证进度见 <a href="https://github.com/alexli-77/Awesome-Desktop-Ghost/pull/3">Windows 移植 PR</a>。遇到问题欢迎<a href="https://github.com/alexli-77/Awesome-Desktop-Ghost/issues">反馈</a>。</p>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
     <h2>常见问题</h2>
@@ -188,7 +213,7 @@
     <details><summary>Ghost 意外退出了，被隐藏的窗口会不会露出来？</summary>
       <p>有一个守护进程（活动监视器里叫 Ghost Watchdog）一直在窗口下面垫着色块。Ghost 崩溃或被强制退出时，色块会立刻顶上，然后 Ghost 自动重启、重新隐藏。如果在活动监视器里同时结束这两个进程，就没有保护了。</p></details>
     <details><summary>有 Windows 版吗？</summary>
-      <p>目前只有 macOS 版。</p></details>
+      <p>有一个实验版（Beta）。交互和 macOS 版一致，但还没在真机上逐项验证，见上面的 <a href="#windows">Windows 版</a> 区块。</p></details>
   </div>
 </section>
 
@@ -197,6 +222,7 @@
     <h2>现在就试试</h2>
     <p class="lead" id="meta2">免费 · 开源 · 不到 1 MB</p>
     <a class="btn primary" style="background:var(--indigo);color:#fff" href="https://github.com/alexli-77/Awesome-Desktop-Ghost/releases/latest/download/Ghost.app.zip">下载 macOS 版</a>
+    <p class="note" style="margin-top:16px">Windows 用户：<a href="#windows">Windows 实验版（Beta）</a></p>
   </div>
 </div>
 
