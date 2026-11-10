@@ -1,0 +1,4 @@
+#include <winver.h>
+
+1 ICON "assets/ghost.ico"
+1 24 "ghost.manifest"

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["ghost-tray", "ghost-inject"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Small binaries, fast startup: optimize for size and strip symbols.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

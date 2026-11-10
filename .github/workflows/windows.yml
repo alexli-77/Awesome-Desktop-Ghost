@@ -1,0 +1,86 @@
+name: Windows
+
+# Builds the Windows port (windows/) on a Windows runner. Runs on branch
+# pushes and PRs so compile breakage shows up early, and on a v* tag it attaches
+# Ghost-Windows.zip to the same release the macOS workflow publishes.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+
+      # x64 is the required build.
+      - name: Build x64
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      # arm64 is best-effort: skip if the runner lacks the ARM64 MSVC tools.
+      - name: Add arm64 target
+        id: arm64_target
+        continue-on-error: true
+        run: rustup target add aarch64-pc-windows-msvc
+
+      - name: Build arm64
+        id: arm64_build
+        continue-on-error: true
+        if: steps.arm64_target.outcome == 'success'
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Force -Path "$stage/x64" | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/Ghost.exe"         "$stage/x64/"
+          Copy-Item "target/x86_64-pc-windows-msvc/release/ghost_inject.dll"  "$stage/x64/"
+          if ("${{ steps.arm64_build.outcome }}" -eq "success") {
+            New-Item -ItemType Directory -Force -Path "$stage/arm64" | Out-Null
+            Copy-Item "target/aarch64-pc-windows-msvc/release/Ghost.exe"        "$stage/arm64/"
+            Copy-Item "target/aarch64-pc-windows-msvc/release/ghost_inject.dll" "$stage/arm64/"
+          }
+          Copy-Item "README-Windows.txt" "$stage/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$stage/*" -DestinationPath "Ghost-Windows.zip" -Force
+          (Get-FileHash "Ghost-Windows.zip" -Algorithm SHA256).Hash | Out-File "Ghost-Windows.zip.sha256" -Encoding ascii
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ghost-Windows
+          path: |
+            windows/Ghost-Windows.zip
+            windows/Ghost-Windows.zip.sha256
+
+      - name: Publish to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            windows/Ghost-Windows.zip
+            windows/Ghost-Windows.zip.sha256
