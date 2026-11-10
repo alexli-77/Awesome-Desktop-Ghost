@@ -12,6 +12,8 @@
 //     (100% = restore)
 //   • ⌃⌥T toggles the frontmost window between 100% and the default opacity
 //   • menu bar 👻 lists windows and current percentages
+//   • menu bar 👻 → "共享/录屏时隐藏": ghosted windows stay visible to you but
+//     vanish from screen sharing and recordings (see "Hide-in-shares mode")
 //
 // Requires macOS 13+, Screen Recording permission.
 
@@ -281,6 +283,913 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: - Hide-in-shares mode
+//
+// Goal: you see a ghosted window at its chosen opacity, while anything that
+// captures the screen (Zoom, Meet, Teams, Cap, QuickTime, screenshots) sees no
+// window at all. Same constraint as above: we can't touch the other app's window,
+// only put our own windows on top of it.
+//
+// Per display, while anything is hidden (DisplayShield):
+//   • cover — sharingType .readOnly, full display: the screen without the hidden
+//     apps, except their windows checked to be unrelated. Captures get this, so
+//     the window is gone however it moves, jumps or slides (Space switches).
+//   • view  — sharingType .none, full display: the real screen, so you see what
+//     you'd see anyway, with a hole at each hidden window where the real screen
+//     is drawn at the chosen opacity over the cover.
+// Leak guards:
+//   • Unknown windows of a hidden app (a menu, sheet or popover that just opened,
+//     a new window) are left out of the cover until classified; at worst a new
+//     window shows up in a share a moment late.
+//   • An app counts as hidden only once a cover frame newer than the filter that
+//     excludes it has arrived (ShieldStream.confirmed).
+//   • The cursor is hidden from captures while it's over a hidden window (CursorCloak).
+//   • A watchdog process keeps blocks under hidden windows in case Ghost dies (CrashGuard).
+// Cost: while something is hidden, your whole screen is shown through a capture
+// (about one display frame later), and the window server does noticeably more work.
+
+let shieldLevel = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 1)
+
+/// Bounds, on-screen flag and owner pid for one window id; nil once it's closed.
+/// Unlike CGWindowListCopyWindowInfo(.optionIncludingWindow), this also finds
+/// windows that are off screen (minimized, app hidden, other Space).
+func windowInfo(_ id: CGWindowID) -> (bounds: CGRect, onScreen: Bool, pid: pid_t)? {
+    var ids: [UnsafeRawPointer?] = [UnsafeRawPointer(bitPattern: UInt(id))]
+    guard let arr = CFArrayCreate(nil, &ids, 1, nil),
+          let list = CGWindowListCreateDescriptionFromArray(arr) as? [[String: Any]],
+          let d = list.first,
+          let bd = d[kCGWindowBounds as String] as? NSDictionary,
+          let bounds = CGRect(dictionaryRepresentation: bd as CFDictionary),
+          let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+    else { return nil }
+    return (bounds, (d[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false, pid)
+}
+
+/// Bounds and on-screen flag of several windows at once, off-screen ones included.
+func describeWindows(_ ids: [CGWindowID]) -> [CGWindowID: (bounds: CGRect, onScreen: Bool)] {
+    guard !ids.isEmpty else { return [:] }
+    var ptrs: [UnsafeRawPointer?] = ids.map { UnsafeRawPointer(bitPattern: UInt($0)) }
+    guard let arr = CFArrayCreate(nil, &ptrs, ptrs.count, nil),
+          let list = CGWindowListCreateDescriptionFromArray(arr) as? [[String: Any]] else { return [:] }
+    var out: [CGWindowID: (CGRect, Bool)] = [:]
+    for d in list {
+        guard let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+              let bd = d[kCGWindowBounds as String] as? NSDictionary,
+              let b = CGRect(dictionaryRepresentation: bd as CFDictionary) else { continue }
+        out[id] = (b, (d[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false)
+    }
+    return out
+}
+
+private func makeOverlay(frame: NSRect, level: NSWindow.Level, sharing: NSWindow.SharingType) -> (NSWindow, CALayer) {
+    let w = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+    w.isOpaque = false
+    w.backgroundColor = .clear
+    w.hasShadow = false
+    w.ignoresMouseEvents = true
+    w.level = level
+    w.sharingType = sharing
+    w.animationBehavior = .none
+    w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+    let v = NSView(frame: NSRect(origin: .zero, size: frame.size))
+    v.wantsLayer = true
+    v.layer!.masksToBounds = true
+    w.contentView = v
+    w.setFrame(frame, display: false)
+    return (w, v.layer!)
+}
+
+/// One capture stream of a display shield, plus which exclusions it is known to
+/// honour. A key (window id or pid) joins `confirmed` only after a frame newer
+/// than the filter that excludes it arrives, or after the screen stayed idle
+/// long enough that nothing excluded can have been on it.
+final class ShieldStream {
+    let name: String
+    var stream: SCStream?
+    var surface: IOSurface?
+    private(set) var confirmed: Set<UInt64> = []
+    private var wanted: Set<UInt64> = []
+    private var applying = false
+    private var pending: (keys: Set<UInt64>, after: UInt64, at: Date)?
+    let makeFilter: (SCShareableContent, Set<UInt64>) -> SCContentFilter
+
+    init(name: String, makeFilter: @escaping (SCShareableContent, Set<UInt64>) -> SCContentFilter) {
+        self.name = name
+        self.makeFilter = makeFilter
+    }
+
+    var startKeys: Set<UInt64> { wanted }
+
+    func started(_ s: SCStream, keys: Set<UInt64>, at t: UInt64) {
+        stream = s
+        pending = (keys, t, Date())
+        apply()
+    }
+
+    func want(_ keys: Set<UInt64>) {
+        wanted = keys
+        confirmed.formIntersection(keys)        // dropped keys need no confirmation
+        apply()
+    }
+
+    private func apply() {
+        guard let s = stream, !applying, wanted != (pending?.keys ?? confirmed) else { return }
+        applying = true
+        let keys = wanted
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                try await s.updateContentFilter(makeFilter(content, keys))
+                let t = mach_absolute_time()
+                await MainActor.run {
+                    applying = false
+                    pending = (keys, t, Date())
+                    apply()
+                }
+            } catch {
+                NSLog("Ghost: \(name) updateContentFilter failed: \(error)")
+                await MainActor.run { applying = false }
+            }
+        }
+    }
+
+    func frame(shownAt t: UInt64) {
+        if let p = pending, t > p.after { confirm(p.keys) }
+    }
+
+    func checkIdle() {
+        if let p = pending, Date().timeIntervalSince(p.at) > 0.25 { confirm(p.keys) }
+    }
+
+    private func confirm(_ keys: Set<UInt64>) {
+        confirmed = keys.intersection(wanted)
+        pending = nil
+    }
+}
+
+/// Key for a pid in a ShieldStream's key set (window ids stay below 2^32).
+func pidKey(_ pid: pid_t) -> UInt64 { 1 << 40 | UInt64(UInt32(bitPattern: pid)) }
+
+/// One display's overlays and capture streams.
+///
+///   cover (sharingType .readOnly, what captures see): full display, the screen
+///     without the hidden apps — except that app's other windows we have checked
+///     are unrelated to the hidden window. Anything new (a menu, popover, sheet,
+///     child panel, a fresh window) starts out excluded, so the share can show a
+///     new window a moment late but never shows a hidden one. Being full-screen,
+///     it needs no tracking: moves, jumps and Space switches can't uncover it.
+///   view (sharingType .none, what only you see): full display, the real screen,
+///     with a hole at each hidden window; inside the hole the real screen at the
+///     chosen opacity over the cover: α·window + (1−α)·what's behind it.
+final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
+    struct Patch { let id: CGWindowID; let pid: pid_t; let rect: CGRect; let alpha: CGFloat }
+
+    let display: SCDisplay
+    var frame: CGRect { display.frame }
+    var onStopped: (() -> Void)?
+
+    let coverWin: NSWindow
+    let viewWin: NSWindow
+    private let coverID: CGWindowID            // read off the main thread, so cached
+    private let coverRoot: CALayer
+    private let viewRoot: CALayer
+    private let coverBase = CALayer()
+    private let viewBase = CALayer()
+    private let viewMask = CAShapeLayer()
+    private var patches: [CGWindowID: CALayer] = [:]
+    private let queue = DispatchQueue(label: "ghost.shield", qos: .userInteractive)
+    private var stopped = false
+
+    private(set) var base: ShieldStream!      // keys: pidKey(hidden apps) + their windows to keep
+    private(set) var view: ShieldStream!      // keys: none
+
+    init(display: SCDisplay) {
+        self.display = display
+        let f = cocoaRect(display.frame)
+        (coverWin, coverRoot) = makeOverlay(frame: f, level: shieldLevel, sharing: .readOnly)
+        (viewWin, viewRoot) = makeOverlay(frame: f, level: NSWindow.Level(rawValue: shieldLevel.rawValue + 1), sharing: .none)
+        coverID = CGWindowID(coverWin.windowNumber)
+        super.init()
+        let me = ProcessInfo.processInfo.processIdentifier
+        let d = display
+        base = ShieldStream(name: "base") { content, keys in
+            let apps = content.applications.filter {
+                $0.processID == me || $0.processID == watchdogPID || keys.contains(pidKey($0.processID)) }
+            let keep = content.windows.filter { keys.contains(UInt64($0.windowID)) }
+            return SCContentFilter(display: d, excludingApplications: apps, exceptingWindows: keep)
+        }
+        view = ShieldStream(name: "view") { content, _ in
+            let apps = content.applications.filter { $0.processID == me || $0.processID == watchdogPID }
+            return SCContentFilter(display: d, excludingApplications: apps, exceptingWindows: [])
+        }
+        let full = CGRect(origin: .zero, size: f.size)
+        for (l, root) in [(coverBase, coverRoot), (viewBase, viewRoot)] {
+            l.frame = full
+            l.contentsGravity = .resize
+            l.isHidden = true
+            l.actions = quietActions
+            root.addSublayer(l)
+        }
+        viewMask.frame = full
+        viewMask.fillRule = .evenOdd
+        viewMask.actions = ["path": NSNull()]
+        viewBase.mask = viewMask
+        // On screen before any filter is built: ScreenCaptureKit only lists apps
+        // that have windows, and Ghost must be listed to exclude itself.
+        coverWin.orderFrontRegardless()
+        viewWin.orderFrontRegardless()
+    }
+
+    private let quietActions: [String: CAAction] = [
+        "contents": NSNull(), "contentsRect": NSNull(), "bounds": NSNull(),
+        "position": NSNull(), "hidden": NSNull(), "opacity": NSNull()]
+
+    func start(keys: Set<UInt64>) {
+        base.want(keys)
+        Task { await self.startStreams(attempt: 0) }
+    }
+
+    func stop() {
+        stopped = true
+        for s in streams.compactMap(\.stream) { Task { try? await s.stopCapture() } }
+        coverWin.orderOut(nil)
+        viewWin.orderOut(nil)
+    }
+
+    func want(_ keys: Set<UInt64>) { base.want(keys) }
+
+    /// The cover is up and known to leave this app's hidden windows out.
+    func isReady(pid: pid_t) -> Bool {
+        base.surface != nil && base.confirmed.contains(pidKey(pid))
+    }
+
+    private func config(fps: Int) -> SCStreamConfiguration {
+        let screen = NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == display.displayID
+        }
+        let c = SCStreamConfiguration()
+        c.pixelFormat = kCVPixelFormatType_32BGRA
+        if let name = screen?.colorSpace?.cgColorSpace?.name { c.colorSpaceName = name }   // no colour shift
+        c.showsCursor = false
+        c.queueDepth = 5
+        c.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        let scale = screen?.backingScaleFactor ?? 2
+        c.width = Int(CGFloat(display.width) * scale)
+        c.height = Int(CGFloat(display.height) * scale)
+        return c
+    }
+
+    private func startStreams(attempt: Int) async {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            let me = ProcessInfo.processInfo.processIdentifier
+            guard content.applications.contains(where: { $0.processID == me }),
+                  content.windows.contains(where: { $0.windowID == coverID }) else {
+                // Our overlays aren't listed yet; without self-exclusion the cover
+                // would capture itself. Wait for the window server to catch up.
+                if attempt < 40, !stopped {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                    await startStreams(attempt: attempt + 1)
+                } else { NSLog("Ghost: shield could not find its own windows in shareable content") }
+                return
+            }
+            let maxFPS = NSScreen.screens.map(\.maximumFramesPerSecond).max() ?? 60
+            var made: [(ShieldStream, SCStream, Set<UInt64>)] = []
+            // Cover: what shares and recordings get, so full rate and resolution.
+            // View: what you see, so the display's own refresh rate.
+            for (ss, fps) in [(base!, 60), (view!, maxFPS)] {
+                let keys = await MainActor.run { ss.startKeys }
+                let s = SCStream(filter: ss.makeFilter(content, keys), configuration: config(fps: fps), delegate: self)
+                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+                made.append((ss, s, keys))
+            }
+            let all = made
+            for (_, s, _) in all { try await s.startCapture() }
+            let t = mach_absolute_time()
+            await MainActor.run {
+                if stopped { all.forEach { m in Task { try? await m.1.stopCapture() } }; return }
+                all.forEach { $0.0.started($0.1, keys: $0.2, at: t) }
+            }
+        } catch {
+            NSLog("Ghost: shield start failed: \(error)")
+            await MainActor.run { onStopped?() }
+        }
+    }
+
+    private var streams: [ShieldStream] { [base, view] }
+
+    func checkIdle() { streams.forEach { $0.checkIdle() } }
+
+    private var lastHoles: [CGRect] = []
+
+    /// Called every tick; commits only what changed, so a still screen costs
+    /// the window server nothing.
+    func layout(_ list: [Patch]) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        if coverBase.isHidden != (base.surface == nil) { coverBase.isHidden = base.surface == nil }
+        if viewBase.isHidden != (view.surface == nil) { viewBase.isHidden = view.surface == nil }
+        let live = Set(list.map(\.id))
+        for (id, l) in patches where !live.contains(id) {
+            l.removeFromSuperlayer()
+            patches[id] = nil
+        }
+        let d = display.frame
+        var holes: [CGRect] = []
+        for p in list.sorted(by: { $0.id < $1.id }) {
+            let l = patches[p.id] ?? addPatch(p.id)
+            let x = p.rect.minX - d.minX, y = d.maxY - p.rect.maxY
+            let r = CGRect(x: x, y: y, width: p.rect.width, height: p.rect.height)
+            let cr = CGRect(x: x / d.width, y: y / d.height, width: p.rect.width / d.width, height: p.rect.height / d.height)
+            let show = isReady(pid: p.pid) && view.surface != nil && p.rect.intersects(d)
+            if l.frame != r { l.frame = r }
+            if l.contentsRect != cr { l.contentsRect = cr }
+            if l.isHidden == show { l.isHidden = !show }
+            if l.opacity != Float(p.alpha) { l.opacity = Float(p.alpha) }
+            if show { holes.append(r) }
+        }
+        if holes != lastHoles {
+            lastHoles = holes
+            let path = CGMutablePath()
+            path.addRect(CGRect(origin: .zero, size: d.size))
+            holes.forEach { path.addRect($0) }
+            viewMask.path = path
+        }
+    }
+
+    private func addPatch(_ id: CGWindowID) -> CALayer {
+        let l = CALayer()
+        l.contentsGravity = .resize
+        l.isHidden = true
+        l.contents = view.surface
+        l.actions = quietActions
+        viewRoot.addSublayer(l)
+        patches[id] = l
+        return l
+    }
+
+    // MARK: SCStreamOutput
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sb.isValid,
+              let atts = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let info = atts.first,
+              let raw = info[.status] as? Int, let status = SCFrameStatus(rawValue: raw),
+              status == .complete || status == .idle
+        else { return }
+        let shown = (info[.displayTime] as? NSNumber)?.uint64Value ?? 0
+        var surface: IOSurface?
+        if status == .complete, let pb = CMSampleBufferGetImageBuffer(sb) {
+            surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue()
+        }
+        DispatchQueue.main.async { [weak self] in self?.frameArrived(stream, surface: surface, shown: shown) }
+    }
+
+    private func frameArrived(_ s: SCStream, surface: IOSurface?, shown: UInt64) {
+        guard let ss = streams.first(where: { $0.stream === s }) else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let surface {
+            ss.surface = surface
+            if ss === base { coverBase.contents = surface }
+            if ss === view {
+                viewBase.contents = surface
+                for l in patches.values { l.contents = surface }
+            }
+        }
+        ss.frame(shownAt: shown)
+        CATransaction.commit()
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        NSLog("Ghost: shield stream stopped: \(error)")
+        // Keep the overlays and their last frames up: a stale cover still hides.
+        DispatchQueue.main.async { [weak self] in self?.onStopped?() }
+    }
+}
+
+/// Over a hidden window, a share would show the cursor moving and clicking over
+/// nothing (and its I-beam would give text fields away). While the mouse is over
+/// one, hide the system cursor — a private SkyLight switch lets a background app
+/// do that — and draw a local-only copy. The window server brings the real cursor
+/// back by itself if Ghost exits.
+final class CursorCloak {
+    private let win: NSWindow
+    private let image = NSImageView()
+    private var hidden = false
+    private var shown: NSCursor?
+    private var monitor: Any?
+
+    static let available: Bool = {
+        typealias MainConn = @convention(c) () -> UInt32
+        typealias SetProp = @convention(c) (UInt32, UInt32, CFString, CFTypeRef) -> Int32
+        guard let sky = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_NOW),
+              let a = dlsym(sky, "SLSMainConnectionID") ?? dlsym(sky, "CGSMainConnectionID"),
+              let b = dlsym(sky, "SLSSetConnectionProperty") ?? dlsym(sky, "CGSSetConnectionProperty")
+        else { return false }
+        let cid = unsafeBitCast(a, to: MainConn.self)()
+        return unsafeBitCast(b, to: SetProp.self)(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue) == 0
+    }()
+
+    init() {
+        win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 32, height: 32), styleMask: .borderless, backing: .buffered, defer: false)
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.hasShadow = false
+        win.ignoresMouseEvents = true
+        win.sharingType = .none
+        win.level = NSWindow.Level(rawValue: shieldLevel.rawValue + 4)
+        win.animationBehavior = .none
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        image.imageScaling = .scaleAxesIndependently
+        win.contentView = image
+    }
+
+    var window: NSWindow { win }
+
+    /// `areas` in CG coordinates: where the cursor must not be seen by captures.
+    func update(hiddenOver areas: [CGRect]) {
+        guard CursorCloak.available else { return }
+        let m = NSEvent.mouseLocation
+        let inside = areas.contains { $0.contains(cgPoint(m)) }
+        if inside != hidden { inside ? cloak() : uncloak() }
+        if hidden { place(m) }
+    }
+
+    func stop() { if hidden { uncloak() } }
+
+    private func place(_ m: NSPoint) {
+        guard let c = NSCursor.currentSystem else { return }
+        let size = c.image.size
+        if c !== shown {
+            shown = c
+            image.image = c.image
+            win.setContentSize(size)
+            image.frame = NSRect(origin: .zero, size: size)
+        }
+        win.setFrameOrigin(NSPoint(x: m.x - c.hotSpot.x, y: m.y - (size.height - c.hotSpot.y)))
+    }
+
+    private func cloak() {
+        hidden = true
+        CGDisplayHideCursor(kCGNullDirectDisplay)
+        place(NSEvent.mouseLocation)
+        win.orderFrontRegardless()
+        monitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        ) { [weak self] _ in self?.place(NSEvent.mouseLocation) }
+    }
+
+    private func uncloak() {
+        hidden = false
+        CGDisplayShowCursor(kCGNullDirectDisplay)
+        win.orderOut(nil)
+        if let m = monitor { NSEvent.removeMonitor(m) }
+        monitor = nil
+        shown = nil
+    }
+}
+
+/// Hidden windows across all displays: positions patches every display frame.
+final class ShareShield {
+    struct Target {
+        let pid: pid_t
+        var alpha: CGFloat
+        var bounds: CGRect
+        var group: CGRect          // the window plus its menus/popovers/sheets
+        var rect: CGRect           // group, padded: the hole in the local view
+        var pad: CGFloat
+        var onScreen = true
+    }
+
+    private(set) var targets: [CGWindowID: Target] = [:]
+    private var shields: [CGDirectDisplayID: DisplayShield] = [:]
+    let cursor = CursorCloak()
+    private var timer: Timer?
+    private var syncing = false
+    private var resyncNeeded = false
+    private var reportedActive: Set<CGWindowID> = []
+    private var screenObserver: NSObjectProtocol?
+
+    var onTargetsChanged: (() -> Void)?
+    var onActive: ((CGWindowID, pid_t) -> Void)?
+
+    /// Covers the window shadow; grows with speed while a window is dragged.
+    private let basePad: CGFloat = 48
+    /// How many layout ticks of motion a patch must lead the window by.
+    private let leadTicks: CGFloat = 4
+    /// A teleporting window can't be out-run anyway; don't blanket the screen.
+    private let maxPad: CGFloat = 240
+
+    var isEmpty: Bool { targets.isEmpty }
+    var pids: Set<pid_t> { Set(targets.values.map(\.pid)) }
+    /// Windows of hidden apps that are unrelated to any hidden window: shown in shares.
+    private var keep: Set<CGWindowID> = []
+    private var keys: Set<UInt64> { Set(targets.values.map { pidKey($0.pid) }).union(keep.map { UInt64($0) }) }
+    var allShields: [DisplayShield] { Array(shields.values) }
+
+    func alpha(of id: CGWindowID) -> CGFloat? { targets[id]?.alpha }
+
+    func isActive(_ id: CGWindowID) -> Bool {
+        guard let t = targets[id], !shields.isEmpty else { return false }
+        return shields.values.allSatisfy { $0.isReady(pid: t.pid) }
+    }
+
+    @discardableResult
+    func set(_ id: CGWindowID, alpha: CGFloat) -> Bool {
+        if targets[id] != nil {
+            targets[id]!.alpha = alpha
+            onTargetsChanged?()
+            return true
+        }
+        guard let info = windowInfo(id) else { return false }
+        let pad = basePad
+        targets[id] = Target(pid: info.pid, alpha: alpha, bounds: info.bounds, group: info.bounds,
+                             rect: info.bounds.insetBy(dx: -pad, dy: -pad), pad: pad)
+        start()
+        shields.values.forEach { $0.want(keys) }
+        onTargetsChanged?()
+        return true
+    }
+
+    func remove(_ id: CGWindowID) {
+        guard targets.removeValue(forKey: id) != nil else { return }
+        reportedActive.remove(id)
+        related[id] = nil
+        layoutAll()                                   // patch gone before the app is re-included
+        shields.values.forEach { $0.want(keys) }
+        onTargetsChanged?()
+        if targets.isEmpty { stop() }
+    }
+
+    func removeAll() {
+        targets.removeAll()
+        reportedActive.removeAll()
+        stop()
+        onTargetsChanged?()
+    }
+
+    private func start() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)         // keep running during menu tracking / drags
+        timer = t
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.syncDisplays() }
+        syncDisplays()
+    }
+
+    private func stop() {
+        timer?.invalidate()
+        timer = nil
+        cursor.stop()
+        if let o = screenObserver { NotificationCenter.default.removeObserver(o) }
+        screenObserver = nil
+        shields.values.forEach { $0.stop() }
+        shields.removeAll()
+    }
+
+    /// Match shields to the current displays. Shields of unchanged displays are
+    /// kept, so plugging in a monitor never uncovers windows on the others.
+    private func syncDisplays() {
+        guard !syncing else { resyncNeeded = true; return }
+        syncing = true
+        Task {
+            let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            await MainActor.run {
+                syncing = false
+                defer { if resyncNeeded { resyncNeeded = false; syncDisplays() } }
+                guard timer != nil, let content else { return }
+                let live = Dictionary(uniqueKeysWithValues: content.displays.map { ($0.displayID, $0) })
+                for (id, s) in shields where live[id]?.frame != s.frame {
+                    s.stop()
+                    shields[id] = nil
+                }
+                for (id, d) in live where shields[id] == nil {
+                    let s = DisplayShield(display: d)
+                    s.onStopped = { [weak self, weak s] in
+                        guard let self, let s, self.shields[id] === s else { return }
+                        self.restartShield(id)
+                    }
+                    shields[id] = s
+                    s.start(keys: keys)
+                }
+                layoutAll()
+            }
+        }
+    }
+
+    /// A stream died: start a new shield first, drop the old one once it's ready.
+    private func restartShield(_ id: CGDirectDisplayID) {
+        guard let old = shields[id] else { return }
+        let fresh = DisplayShield(display: old.display)
+        fresh.onStopped = { [weak self, weak fresh] in
+            guard let self, let fresh, self.shields[id] === fresh else { return }
+            self.restartShield(id)
+        }
+        fresh.start(keys: keys)
+        var check: Timer?
+        check = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self else { check?.invalidate(); return }
+            fresh.checkIdle()
+            if self.targets.values.allSatisfy({ fresh.isReady(pid: $0.pid) }) {
+                check?.invalidate()
+                self.shields[id] = fresh
+                old.stop()
+            }
+        }
+    }
+
+    private var tickCount = 0
+    /// Per hidden window, the same-app windows that belong to it (last full scan).
+    private var related: [CGWindowID: Set<CGWindowID>] = [:]
+    /// Every on-screen window of a hidden app → the hidden window it belongs to (nil: unrelated).
+    private var known: [CGWindowID: CGWindowID?] = [:]
+
+    /// 120 Hz: follow the hidden windows and their children, looked up by id.
+    private func tick() {
+        tickCount += 1
+        if tickCount % 8 == 1 { scan() }
+        let ids = Array(targets.keys) + related.values.flatMap { $0 }
+        let info = describeWindows(ids)
+        var gone: [CGWindowID] = []
+        for (id, var t) in targets {
+            guard let w = info[id] else { gone.append(id); continue }   // closed
+            t.onScreen = w.onScreen
+            guard w.onScreen else { targets[id] = t; continue }      // off screen: keep the hole where it was
+            let b = w.bounds
+            let step = max(abs(b.minX - t.bounds.minX), abs(b.minY - t.bounds.minY),
+                           abs(b.maxX - t.bounds.maxX), abs(b.maxY - t.bounds.maxY))
+            t.pad = min(max(basePad + step * leadTicks, t.pad * 0.97, basePad), maxPad)  // jump up, ease down
+            t.bounds = b
+            var group = b
+            for oid in related[id] ?? [] {
+                if let o = info[oid], o.onScreen, o.bounds.intersects(b) { group = group.union(o.bounds) }
+            }
+            t.group = group
+            t.rect = group.insetBy(dx: -t.pad, dy: -t.pad)
+            targets[id] = t
+        }
+        gone.forEach(remove)
+        layoutAll()
+    }
+
+    /// 15 Hz: sort the hidden apps' other windows into "belongs to a hidden window"
+    /// (left out of shares with it) and "unrelated" (shown in shares). A window
+    /// that appears in between is unknown, and unknown windows stay left out.
+    private func scan() {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return }
+        var wins: [CGWindowID: (pid: pid_t, layer: Int, bounds: CGRect, z: Int, titled: Bool)] = [:]
+        let watched = pids
+        for (z, d) in list.enumerated() {                // front to back
+            guard let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, watched.contains(pid),
+                  let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let bd = d[kCGWindowBounds as String] as? NSDictionary,
+                  let b = CGRect(dictionaryRepresentation: bd as CFDictionary)
+            else { continue }
+            let titled = !((d[kCGWindowName as String] as? String) ?? "").isEmpty
+            wins[id] = (pid, (d[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0, b, z, titled)
+        }
+        // Sticky: once a window is known to belong to a hidden window it stays so,
+        // and a window first seen on top of a hidden one belongs to it (a sheet or
+        // popover mid-animation may not look like a child yet). A window that was
+        // already there, like one you're presenting, is never swallowed for merely
+        // being dragged over a hidden one.
+        var owner: [CGWindowID: CGWindowID?] = [:]
+        for (oid, o) in wins where targets[oid] == nil {
+            if let prev = known[oid], let t = prev, targets[t] != nil { owner[oid] = t; continue }
+            var match: CGWindowID?
+            for (id, t) in targets {
+                guard let w = wins[id], o.pid == t.pid, o.z < w.z, o.bounds.intersects(w.bounds) else { continue }
+                let childLike = o.layer != 0 || w.bounds.contains(o.bounds)
+                    || (!o.titled && o.bounds.width * o.bounds.height < w.bounds.width * w.bounds.height)
+                if known[oid] == nil || childLike { match = id; break }
+            }
+            owner[oid] = match
+        }
+        known = owner
+        var rel: [CGWindowID: Set<CGWindowID>] = [:]
+        for id in targets.keys { rel[id] = wins[id] == nil ? related[id] : [] }   // off screen: keep last
+        for (oid, t) in owner { if let t, wins[t] != nil { rel[t, default: []].insert(oid) } }
+        related = rel
+        let newKeep = Set(wins.keys).subtracting(targets.keys).subtracting(rel.values.flatMap { $0 })
+        if newKeep != keep {
+            keep = newKeep
+            shields.values.forEach { $0.want(keys) }
+        }
+    }
+
+    private func layoutAll() {
+        let patches = targets.map { DisplayShield.Patch(id: $0.key, pid: $0.value.pid, rect: $0.value.rect, alpha: $0.value.alpha) }
+        for s in shields.values {
+            s.checkIdle()
+            s.layout(patches)
+        }
+        cursor.update(hiddenOver: targets.filter { $0.value.onScreen && isActive($0.key) }
+                                         .map { $0.value.group.insetBy(dx: -6, dy: -6) })
+        for id in targets.keys where !reportedActive.contains(id) && isActive(id) {
+            reportedActive.insert(id)
+            onActive?(id, targets[id]!.pid)
+        }
+    }
+}
+
+// MARK: - Crash guard for hide mode
+//
+// If Ghost dies, its overlays vanish with it. A watchdog child process keeps an
+// opaque block under every hidden window at all times — below Ghost's overlays
+// and left out of Ghost's captures, so nobody sees it while Ghost runs. The
+// moment Ghost dies the blocks are what's on top, with no reaction time. The
+// watchdog then hides the apps that owned hidden windows, and after a crash
+// relaunches Ghost, which covers those windows again and un-hides the apps.
+
+struct HiddenState: Codable {
+    struct Entry: Codable { let window: UInt32; let pid: Int32; let alpha: Double; var active: Bool }
+    var ghost: Int32
+    var entries: [Entry]
+
+    static var dir: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let d = base.appendingPathComponent(Bundle.main.bundleIdentifier ?? "com.yangli.ghost")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+    static var file: URL { dir.appendingPathComponent("hidden.json") }
+    static var crashMarker: URL { dir.appendingPathComponent("crashed") }
+
+    static func load() -> HiddenState? {
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        return try? JSONDecoder().decode(HiddenState.self, from: data)
+    }
+
+    func save() {
+        if entries.isEmpty {
+            try? FileManager.default.removeItem(at: HiddenState.file)
+        } else if let data = try? JSONEncoder().encode(self) {
+            try? data.write(to: HiddenState.file, options: .atomic)
+        }
+    }
+}
+
+private var crashMarkerFD: Int32 = -1
+/// The watchdog's pid; its blocks must be left out of Ghost's own captures.
+var watchdogPID: pid_t = 0
+
+enum CrashGuard {
+    /// Called in the Ghost process at launch.
+    static func install() {
+        try? FileManager.default.removeItem(at: HiddenState.crashMarker)
+        crashMarkerFD = open(HiddenState.crashMarker.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        // Empty file = running; a byte written by the handler = crashed.
+        for sig in [SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGABRT, SIGFPE] {
+            signal(sig) { s in
+                if crashMarkerFD >= 0 { var b: UInt8 = 1; _ = write(crashMarkerFD, &b, 1) }
+                signal(s, SIG_DFL)
+                raise(s)
+            }
+        }
+        guard let exe = Bundle.main.executablePath else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = ["--watchdog", String(getpid())]
+        if (try? p.run()) != nil { watchdogPID = p.processIdentifier }
+    }
+
+    /// Clean exit: take the watchdog (and its blocks) down first, then forget state.
+    static func disarm() {
+        if watchdogPID > 0 { kill(watchdogPID, SIGKILL) }
+        try? FileManager.default.removeItem(at: HiddenState.file)
+        if crashMarkerFD >= 0 { close(crashMarkerFD); crashMarkerFD = -1 }
+        try? FileManager.default.removeItem(at: HiddenState.crashMarker)
+    }
+
+    /// Entry point of the watchdog process.
+    static func runWatchdog(parent: pid_t) -> Never {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let dog = Watchdog(parent: parent)
+        dog.start()
+        app.run()
+        exit(0)
+    }
+}
+
+/// Runs in the watchdog process (see above).
+final class Watchdog {
+    private let parent: pid_t
+    private var blocks: [UInt32: NSWindow] = [:]
+    private var source: DispatchSourceProcess?
+    private var timer: Timer?
+    private var state: HiddenState?
+    private var stateStamp: Date?
+    private var parentGoneAt: Date?
+    private var relaunched = false
+    /// What was covered when Ghost died: blocked until a new Ghost covers it.
+    private var orphans: [HiddenState.Entry] = []
+
+    init(parent: pid_t) { self.parent = parent }
+
+
+    func start() {
+        let src = DispatchSource.makeProcessSource(identifier: parent, eventMask: .exit, queue: .main)
+        src.setEventHandler { [weak self] in self?.parentExited() }
+        src.resume()
+        source = src
+        let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        if kill(parent, 0) != 0 { parentExited() }
+    }
+
+    private func reloadState() {
+        let stamp = (try? FileManager.default.attributesOfItem(atPath: HiddenState.file.path))?[.modificationDate] as? Date
+        guard stamp != stateStamp else { return }
+        stateStamp = stamp
+        state = stamp == nil ? nil : HiddenState.load()
+    }
+
+    private func tick() {
+        reloadState()
+        // While Ghost runs: a block under each window it covers. After it died:
+        // the windows it covered then, whatever a relaunched Ghost writes now.
+        let entries = parentGoneAt != nil ? orphans
+            : (state?.ghost == parent ? (state?.entries.filter(\.active) ?? []) : [])
+        if entries.isEmpty, blocks.isEmpty, parentGoneAt == nil { return }   // nothing hidden: idle
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        var bounds: [UInt32: (pid: Int32, rect: CGRect)] = [:]
+        for d in list {
+            guard let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let bd = d[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: bd as CFDictionary) else { continue }
+            bounds[id] = (pid, r)
+        }
+        var live: Set<UInt32> = []
+        for e in entries {
+            guard let w = bounds[e.window] else { continue }           // off screen: nothing to cover
+            var rect = w.rect
+            for (_, o) in bounds where o.pid == e.pid && o.rect.intersects(w.rect) { rect = rect.union(o.rect) }
+            rect = rect.insetBy(dx: -48, dy: -48)
+            let win = blocks[e.window] ?? makeBlock(e.window)
+            let f = cocoaRect(rect)
+            if win.frame != f { win.setFrame(f, display: false) }
+            if !win.isVisible { win.orderFrontRegardless() }
+            live.insert(e.window)
+        }
+        for (id, w) in blocks where !live.contains(id) { w.orderOut(nil); blocks[id] = nil }
+
+        guard let gone = parentGoneAt else { return }
+        let age = Date().timeIntervalSince(gone)
+        if relaunched {
+            // Done once a new Ghost covers every orphan (or the window closed).
+            let covered = Set((state?.ghost != parent ? state?.entries ?? [] : []).filter(\.active).map(\.window))
+            if orphans.allSatisfy({ covered.contains($0.window) || windowInfo($0.window) == nil }) {
+                exit(0)
+            }
+            if age > 60 { exit(0) }
+        } else if live.isEmpty || age > 10 {
+            exit(0)                                                 // the apps are hidden now
+        }
+    }
+
+    private func makeBlock(_ id: UInt32) -> NSWindow {
+        let w = NSWindow(contentRect: .zero, styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = true
+        w.backgroundColor = NSColor(calibratedWhite: 0.5, alpha: 1)
+        w.hasShadow = false
+        w.ignoresMouseEvents = true
+        w.level = NSWindow.Level(rawValue: shieldLevel.rawValue - 1)   // just under Ghost's cover
+        w.animationBehavior = .none
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        blocks[id] = w
+        return w
+    }
+
+    private func parentExited() {
+        guard parentGoneAt == nil else { return }
+        parentGoneAt = Date()
+        reloadState()
+        guard let st = state, st.ghost == parent, !st.entries.isEmpty else { exit(0) }   // clean exit
+        orphans = st.entries.filter(\.active)
+        var allHidden = true
+        for pid in Set(orphans.map(\.pid)) {
+            allHidden = (NSRunningApplication(processIdentifier: pid)?.hide() ?? false) && allHidden
+        }
+        let crashed = ((try? Data(contentsOf: HiddenState.crashMarker))?.count ?? 0) > 0
+        // After a crash, or if an app refused to hide, bring Ghost back to cover.
+        guard crashed || !allHidden else { return }
+        relaunched = true
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = false
+        cfg.createsNewApplicationInstance = true      // LaunchServices may still list the dead one
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: cfg) { _, err in
+            if let err { NSLog("Ghost watchdog: relaunch failed: \(err)") }
+        }
+    }
+}
+
 // MARK: - Hover slider HUD
 
 final class HUDPanel: NSPanel {
@@ -294,7 +1203,7 @@ final class HUDPanel: NSPanel {
                    styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         isFloatingPanel = true
-        level = .popUpMenu                      // above the ghost overlays
+        level = NSWindow.Level(rawValue: shieldLevel.rawValue + 2)   // above all overlays
         isOpaque = false
         backgroundColor = .clear
         hasShadow = true
@@ -342,6 +1251,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private var ghosts: [CGWindowID: Ghost] = [:]
+    private let shield = ShareShield()
+    /// Hide ghosted windows from screen sharing / recording (only you see them).
+    private var hideInShares = UserDefaults.standard.bool(forKey: "HideInShares") {
+        didSet { UserDefaults.standard.set(hideInShares, forKey: "HideInShares") }
+    }
+    private var unhideWhenCovered: Set<pid_t> = []
     private var defaultOpacity: CGFloat = 0.6
     private var hotKeyRef: EventHotKeyRef?
 
@@ -379,7 +1294,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.pollHover()
         }
         registerHotKey()
-        _ = ensurePermission()
+
+        CrashGuard.install()
+        shield.onTargetsChanged = { [weak self] in self?.saveHiddenState() }
+        shield.onActive = { [weak self] _, pid in
+            self?.saveHiddenState()                   // the watchdog puts its block under it now
+            self?.unhideIfCovered(pid)
+        }
+        if ensurePermission() { recoverHiddenWindows() }
+    }
+
+    // MARK: hide-in-shares bookkeeping
+
+    private func saveHiddenState() {
+        HiddenState(ghost: getpid(), entries: shield.targets.map {
+            .init(window: $0.key, pid: $0.value.pid, alpha: Double($0.value.alpha), active: shield.isActive($0.key))
+        }).save()
+    }
+
+    /// After a crash (or a force quit) the watchdog hid the apps that owned hidden
+    /// windows. Cover those windows again, then bring the apps back.
+    private func recoverHiddenWindows() {
+        guard let st = HiddenState.load() else { return }
+        hideInShares = true
+        for e in st.entries where windowInfo(e.window)?.pid == e.pid {
+            if shield.set(e.window, alpha: CGFloat(e.alpha)) { unhideWhenCovered.insert(e.pid) }
+        }
+        saveHiddenState()
+    }
+
+    private func unhideIfCovered(_ pid: pid_t) {
+        guard unhideWhenCovered.contains(pid),
+              shield.targets.filter({ $0.value.pid == pid }).keys.allSatisfy(shield.isActive) else { return }
+        unhideWhenCovered.remove(pid)
+        NSRunningApplication(processIdentifier: pid)?.unhide()
     }
 
     // MARK: Screen Recording permission
@@ -417,21 +1365,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         a.runModal()
     }
 
-    func applicationWillTerminate(_: Notification) { ghosts.values.forEach { $0.stop() } }
+    func applicationShouldTerminate(_: NSApplication) -> NSApplication.TerminateReply {
+        guard !shield.isEmpty else { return .terminateNow }
+        // macOS no longer lets one app hide another, so all we can do is warn.
+        let a = NSAlert()
+        a.messageText = "还有 \(shield.targets.count) 个窗口在共享中被隐藏"
+        a.informativeText = "退出 Ghost 后，它们会立刻出现在共享和录屏画面里。"
+        a.addButton(withTitle: "取消")
+        a.addButton(withTitle: "仍然退出")
+        NSApp.activate(ignoringOtherApps: true)
+        return a.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+    }
+
+    func applicationWillTerminate(_: Notification) {
+        ghosts.values.forEach { $0.stop() }
+        CrashGuard.disarm()
+    }
 
     // MARK: opacity control
 
     private func percent(of id: CGWindowID) -> Double {
-        ghosts[id].map { Double($0.opacity * 100) } ?? 100
+        if let a = shield.alpha(of: id) { return Double(a * 100) }
+        return ghosts[id].map { Double($0.opacity * 100) } ?? 100
     }
+
+    private func isGhosted(_ id: CGWindowID) -> Bool { ghosts[id] != nil || shield.alpha(of: id) != nil }
 
     private func setOpacity(for id: CGWindowID, percent: Double) {
         if percent >= 99 {                       // 100% = restore
             ghosts[id]?.stop()
             ghosts[id] = nil
+            shield.remove(id)
             return
         }
         let op = CGFloat(percent) / 100
+        if hideInShares {
+            guard ensurePermission() else { hideHUD(); return }
+            shield.set(id, alpha: op)
+            return
+        }
         if let g = ghosts[id] {
             g.opacity = op
         } else {
@@ -453,13 +1425,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func restoreAll() {
         ghosts.values.forEach { $0.stop() }
         ghosts.removeAll()
+        shield.removeAll()
+    }
+
+    /// Switch modes, carrying every ghosted window and its opacity over.
+    private func setHideInShares(_ on: Bool) {
+        guard on != hideInShares else { return }
+        let carried: [(CGWindowID, Double)] =
+            ghosts.map { ($0.key, Double($0.value.opacity * 100)) } +
+            shield.targets.map { ($0.key, Double($0.value.alpha * 100)) }
+        if on {
+            hideInShares = true
+            carried.forEach { setOpacity(for: $0.0, percent: $0.1) }   // cover first…
+            ghosts.values.forEach { $0.stop() }                        // …then drop the old overlays
+            ghosts.removeAll()
+        } else {
+            hideInShares = false
+            shield.removeAll()
+            carried.forEach { setOpacity(for: $0.0, percent: $0.1) }
+        }
     }
 
     /// Hotkey: toggle the frontmost app's top window between 100% and the default.
     func toggleFrontmost() {
         guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier,
               let w = onScreenWindows().first(where: { $0.pid == pid }) else { return }
-        setOpacity(for: w.id, percent: ghosts[w.id] == nil ? Double(defaultOpacity * 100) : 100)
+        setOpacity(for: w.id, percent: isGhosted(w.id) ? 100 : Double(defaultOpacity * 100))
         if hud.isVisible, hudTarget?.id == w.id { hud.set(percent: percent(of: w.id)) }
     }
 
@@ -540,8 +1531,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         opItem.submenu = sub
         menu.addItem(opItem)
 
-        if !ghosts.isEmpty {
-            menu.addItem(withTitle: "全部恢复 (\(ghosts.count))", action: #selector(restoreAllAction), keyEquivalent: "")
+        let hide = NSMenuItem(title: "共享/录屏时隐藏（只有你能看到）", action: #selector(toggleHideInShares), keyEquivalent: "")
+        hide.state = hideInShares ? .on : .off
+        menu.addItem(hide)
+
+        let count = ghosts.count + shield.targets.count
+        if count > 0 {
+            menu.addItem(withTitle: "全部恢复 (\(count))", action: #selector(restoreAllAction), keyEquivalent: "")
         }
 
         let login = NSMenuItem(title: "登录时自动启动", action: #selector(toggleLoginItem), keyEquivalent: "")
@@ -554,10 +1550,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(head)
         for w in onScreenWindows().prefix(30) {
             var name = String(w.label.prefix(60))
-            if let g = ghosts[w.id] { name += "   \(Int(g.opacity * 100))%" }
+            if isGhosted(w.id) { name += "   \(Int(percent(of: w.id)))%" }
             let it = NSMenuItem(title: name, action: #selector(toggleWindow(_:)), keyEquivalent: "")
             it.representedObject = w.id
-            it.state = ghosts[w.id] != nil ? .on : .off
+            it.state = isGhosted(w.id) ? .on : .off
             menu.addItem(it)
         }
 
@@ -567,8 +1563,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleWindow(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? CGWindowID else { return }
-        setOpacity(for: id, percent: ghosts[id] == nil ? Double(defaultOpacity * 100) : 100)
+        setOpacity(for: id, percent: isGhosted(id) ? 100 : Double(defaultOpacity * 100))
     }
+
+    @objc private func toggleHideInShares() { setHideInShares(!hideInShares) }
 
     @objc private func setDefaultOpacity(_ sender: NSMenuItem) {
         defaultOpacity = CGFloat(sender.tag) / 100
@@ -606,8 +1604,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
-app.run()
+func ghostMain() {
+    let args = CommandLine.arguments
+    if let i = args.firstIndex(of: "--watchdog"), i + 1 < args.count, let parent = Int32(args[i + 1]) {
+        CrashGuard.runWatchdog(parent: parent)
+    }
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)   // menu-bar only, no Dock icon
+    app.run()
+}
+
+ghostMain()
