@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost 👻 · 让任何 Mac 窗口变透明</title>
+<meta name="description" content="Ghost 让任何 macOS 窗口变透明，点击照常穿透；共享屏幕或录屏时，还能让窗口只有你自己看得见。免费开源，不用关闭 SIP。">
+<meta property="og:title" content="Ghost 👻 · 让任何 Mac 窗口变透明">
+<meta property="og:description" content="窗口半透明、共享屏幕时只有你看得见。免费开源的 macOS 菜单栏小工具。">
+<meta property="og:image" content="icon-512.png">
+<link rel="icon" type="image/png" href="favicon.png">
+<style>
+  :root {
+    --ink: #1d1b2e; --muted: #5f5b78; --line: #e6e3f2; --bg: #faf9ff;
+    --indigo: #3b2f86; --indigo-2: #26205c; --accent: #7c6cff; --ok: #1a7f4b; --no: #b42318;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; color: var(--ink); background: var(--bg); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+
+  /* hero */
+  header { background: radial-gradient(1200px 500px at 50% -10%, #5a4bc4 0%, var(--indigo) 40%, var(--indigo-2) 100%); color: #fff; padding: 72px 0 96px; text-align: center; }
+  header img.logo { width: 120px; height: 120px; filter: drop-shadow(0 12px 30px rgba(0,0,0,.35)); }
+  header h1 { font-size: 52px; margin: 18px 0 6px; letter-spacing: -.5px; }
+  header p.tag { font-size: 22px; margin: 0 auto; max-width: 640px; opacity: .92; }
+  .cta { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 10px; padding: 14px 26px; border-radius: 12px; font-weight: 600; font-size: 17px; }
+  .btn.primary { background: #fff; color: var(--indigo); box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+  .btn.ghost { border: 1.5px solid rgba(255,255,255,.55); color: #fff; }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .meta { margin-top: 14px; font-size: 14px; opacity: .8; }
+
+  /* demo */
+  .demo { margin: -56px auto 0; display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  .screen { background: #fff; border-radius: 16px; box-shadow: 0 20px 50px rgba(38,32,92,.18); overflow: hidden; }
+  .screen .cap { padding: 10px 16px; font-size: 14px; font-weight: 600; color: var(--muted); border-bottom: 1px solid var(--line); }
+  .stage { position: relative; height: 250px; background: linear-gradient(135deg, #eef2ff, #fdf2f8); }
+  .slide { position: absolute; inset: 22px 22px 22px 22px; background: #fff; border-radius: 10px; box-shadow: 0 4px 14px rgba(0,0,0,.08); padding: 18px 22px; }
+  .slide b { font-size: 20px; display: block; margin-bottom: 10px; }
+  .bar { height: 10px; border-radius: 5px; background: #e4e1f5; margin: 9px 0; }
+  .bar.s { width: 60%; } .bar.m { width: 78%; } .bar.l { width: 90%; }
+  .notes { position: absolute; right: 34px; top: 58px; width: 46%; height: 150px; border-radius: 10px; background: #fffbe6; border: 1px solid #f1e3a1; padding: 12px 14px; font-size: 13px; color: #6b5a10; opacity: .55; box-shadow: 0 8px 22px rgba(0,0,0,.12); }
+  .notes .tb { display: flex; gap: 5px; margin-bottom: 8px; } .notes .tb i { width: 9px; height: 9px; border-radius: 50%; background: #ff5f57; }
+  .notes .tb i:nth-child(2) { background: #febc2e; } .notes .tb i:nth-child(3) { background: #28c840; }
+  .badge { position: absolute; left: 34px; bottom: 32px; font-size: 13px; padding: 4px 10px; border-radius: 999px; background: rgba(59,47,134,.9); color: #fff; }
+
+  section { padding: 72px 0 8px; }
+  h2 { font-size: 30px; margin: 0 0 8px; letter-spacing: -.3px; }
+  .lead { color: var(--muted); margin: 0 0 28px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  .card .ic { font-size: 28px; }
+  .card h3 { margin: 8px 0 6px; font-size: 18px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  ol.steps { list-style: none; padding: 0; margin: 0; counter-reset: s; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  ol.steps li { min-width: 0; overflow-wrap: anywhere; counter-increment: s; background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px 14px 60px; position: relative; }
+  ol.steps li::before { content: counter(s); position: absolute; left: 18px; top: 13px; width: 28px; height: 28px; border-radius: 50%; background: var(--indigo); color: #fff; font-weight: 700; display: grid; place-items: center; font-size: 15px; }
+  code { font: 13.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: #f0eefb; padding: 2px 6px; border-radius: 6px; }
+  pre { background: #1d1b2e; color: #e9e6ff; padding: 12px 16px; border-radius: 10px; overflow-x: auto; margin: 10px 0 0; }
+  pre code { background: none; padding: 0; color: inherit; }
+
+  table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--line); font-size: 15px; vertical-align: top; }
+  th { background: #f4f2fd; font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .yes { color: var(--ok); font-weight: 600; } .noo { color: var(--no); font-weight: 600; } .maybe { color: #9a6700; font-weight: 600; }
+  .note { font-size: 14px; color: var(--muted); margin-top: 10px; }
+
+  details { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px 18px; margin-bottom: 10px; }
+  summary { cursor: pointer; font-weight: 600; }
+  details p { color: var(--muted); margin: 10px 0 0; }
+
+  .final { text-align: center; padding: 80px 0; }
+  footer { border-top: 1px solid var(--line); padding: 26px 0 40px; color: var(--muted); font-size: 14px; text-align: center; }
+
+  @media (max-width: 760px) {
+    header h1 { font-size: 40px; } header p.tag { font-size: 18px; }
+    .demo, .grid3 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <img class="logo" src="icon-512.png" alt="Ghost 图标">
+    <h1>Ghost</h1>
+    <p class="tag">让任何 Mac 窗口变透明。<br>共享屏幕时，还能让它只有你自己看得见。</p>
+    <div class="cta">
+      <a class="btn primary" id="dl" href="https://github.com/alexli-77/Awesome-Desktop-Ghost/releases/latest/download/Ghost.app.zip">
+        下载 macOS 版
+      </a>
+      <a class="btn ghost" href="https://github.com/alexli-77/Awesome-Desktop-Ghost">GitHub 源码</a>
+    </div>
+    <div class="meta" id="meta">macOS 13 及以上 · Apple 芯片 / Intel 通用 · 免费开源</div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="demo">
+    <div class="screen">
+      <div class="cap">你自己看到的</div>
+      <div class="stage">
+        <div class="slide"><b>Q4 业务回顾</b><div class="bar l"></div><div class="bar m"></div><div class="bar s"></div><div class="bar m"></div></div>
+        <div class="notes"><div class="tb"><i></i><i></i><i></i></div>讲稿：先讲增长，再讲留存…<br>数字：同比 +32%</div>
+        <div class="badge">讲稿窗口 55% 透明</div>
+      </div>
+    </div>
+    <div class="screen">
+      <div class="cap">会议里的观众看到的</div>
+      <div class="stage">
+        <div class="slide"><b>Q4 业务回顾</b><div class="bar l"></div><div class="bar m"></div><div class="bar s"></div><div class="bar m"></div></div>
+        <div class="badge">讲稿窗口不存在</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <h2>它能做什么</h2>
+    <p class="lead">一个住在菜单栏里的 👻，不占 Dock，不改任何 App。</p>
+    <div class="grid3">
+      <div class="card"><div class="ic">🪟</div><h3>任意窗口半透明</h3>
+        <p>鼠标停在窗口标题栏上，出现滑块，拖到想要的透明度。窗口照常能点、能打字。</p></div>
+      <div class="card"><div class="ic">🙈</div><h3>共享时只有你看得见</h3>
+        <p>打开「共享/录屏时隐藏」，被调透明的窗口不会出现在屏幕共享、录屏和截图里。适合讲稿、提词、私人消息。</p></div>
+      <div class="card"><div class="ic">🛡️</div><h3>不用关 SIP</h3>
+        <p>不注入、不破解系统，只需要「屏幕录制」权限。代码完全开源，全部在本机运行，不联网。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>安装</h2>
+    <p class="lead">大约 1 分钟。</p>
+    <ol class="steps">
+      <li>点上面的「下载 macOS 版」，解压得到 <code>Ghost.app</code>，拖进「应用程序」文件夹。</li>
+      <li>双击打开。如果提示「无法验证开发者」：打开 <b>系统设置 → 隐私与安全性</b>，在页面底部点「仍要打开」。也可以在终端运行一次：
+        <pre><code>xattr -dr com.apple.quarantine /Applications/Ghost.app</code></pre></li>
+      <li>首次打开会请求「屏幕录制」权限：在 <b>系统设置 → 隐私与安全性 → 屏幕录制</b> 里打开 Ghost，然后点菜单栏 👻 → 退出，再重新打开。</li>
+      <li>完成。菜单栏出现 👻 就可以用了。想开机自动启动：👻 → 登录时自动启动。</li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>怎么用</h2>
+    <p class="lead">三种方式，选顺手的。</p>
+    <div class="grid3">
+      <div class="card"><div class="ic">🖱️</div><h3>悬停标题栏</h3><p>在任意窗口的标题栏停 0.3 秒，右上角出现滑块。拖到 100% 恢复原样。</p></div>
+      <div class="card"><div class="ic">⌨️</div><h3>快捷键 ⌃⌥T</h3><p>一键切换最前面那个窗口的透明状态，默认透明度可以在菜单里改。</p></div>
+      <div class="card"><div class="ic">👻</div><h3>菜单栏</h3><p>列出所有窗口和当前透明度，点一下切换；也能一键全部恢复、开关「共享/录屏时隐藏」。</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>「共享时隐藏」支持哪些软件</h2>
+    <p class="lead">隐藏能不能生效，取决于共享/录屏软件是否遵守 macOS 的「不要截取此窗口」标记。正式使用前，建议先用会议软件的共享预览，或另一台设备入会看一眼。</p>
+    <table>
+      <tr><th>软件</th><th>结果</th></tr>
+      <tr><td>Chrome 的网页屏幕共享（网页会议用的就是它）</td><td class="yes">✓ 已实测可隐藏</td></tr>
+      <tr><td>macOS 全屏截图（⇧⌘3）</td><td class="yes">✓ 已实测可隐藏</td></tr>
+      <tr><td>Chrome / Edge 里的 Google Meet、Zoom / Teams / 飞书网页版会议，⇧⌘5 录屏、QuickTime、Cap</td><td class="maybe">同一套系统机制，预期可以，建议先自测</td></tr>
+      <tr><td>Zoom / Teams 桌面客户端、Safari</td><td class="maybe">未测试，请先自测</td></tr>
+      <tr><td>飞书 / Lark 桌面客户端的录屏和共享</td><td class="noo">✗ 无法隐藏（它直接抓取屏幕原始画面）</td></tr>
+    </table>
+    <p class="note">建议：需要隐藏窗口的会议，用 Chrome 打开网页版并选择共享「整个屏幕」。</p>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>常见问题</h2>
+    <details><summary>为什么要「屏幕录制」权限？</summary>
+      <p>macOS 不允许一个 App 直接修改另一个 App 的窗口。Ghost 的做法是实时截取「窗口背后的画面」，铺在窗口上面，看起来就像窗口变透明了。截取画面需要这个权限。画面只在本机处理，不会保存或上传。</p></details>
+    <details><summary>透明的窗口还能点吗？</summary>
+      <p>能。Ghost 铺上去的那一层会让鼠标点击直接穿透到下面的真实窗口。</p></details>
+    <details><summary>会不会很耗电？</summary>
+      <p>普通透明模式开销很小。开启「共享时隐藏」并且有窗口被隐藏时，系统图形进程大约多用半个 CPU 核心；没有窗口被隐藏时没有额外开销。</p></details>
+    <details><summary>Ghost 意外退出了，被隐藏的窗口会不会露出来？</summary>
+      <p>有一个守护进程（活动监视器里叫 Ghost Watchdog）一直在窗口下面垫着色块。Ghost 崩溃或被强制退出时，色块会立刻顶上，然后 Ghost 自动重启、重新隐藏。如果在活动监视器里同时结束这两个进程，就没有保护了。</p></details>
+    <details><summary>有 Windows 版吗？</summary>
+      <p>目前只有 macOS 版。</p></details>
+  </div>
+</section>
+
+<div class="final">
+  <div class="wrap">
+    <h2>现在就试试</h2>
+    <p class="lead" id="meta2">免费 · 开源 · 不到 1 MB</p>
+    <a class="btn primary" style="background:var(--indigo);color:#fff" href="https://github.com/alexli-77/Awesome-Desktop-Ghost/releases/latest/download/Ghost.app.zip">下载 macOS 版</a>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap">
+    Ghost 是 MIT 协议的开源项目 · <a href="https://github.com/alexli-77/Awesome-Desktop-Ghost">GitHub</a> ·
+    <a href="https://github.com/alexli-77/Awesome-Desktop-Ghost/releases">所有版本</a> ·
+    <a href="https://github.com/alexli-77/Awesome-Desktop-Ghost/issues">反馈问题</a>
+  </div>
+</footer>
+
+<script>
+  // Show the latest version and size; the download link itself never needs updating.
+  fetch('https://api.github.com/repos/alexli-77/Awesome-Desktop-Ghost/releases/latest')
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(rel => {
+      const zip = (rel.assets || []).find(a => a.name === 'Ghost.app.zip');
+      const size = zip ? (zip.size / 1024 / 1024).toFixed(1) + ' MB' : '';
+      const date = (rel.published_at || '').slice(0, 10);
+      document.getElementById('meta').textContent =
+        [rel.tag_name, date, 'macOS 13 及以上', 'Apple 芯片 / Intel 通用', size].filter(Boolean).join(' · ');
+      document.getElementById('meta2').textContent = ['免费', '开源', rel.tag_name, size].filter(Boolean).join(' · ');
+    })
+    .catch(() => {});
+</script>
+</body>
+</html>

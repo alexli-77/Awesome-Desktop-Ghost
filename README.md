@@ -4,6 +4,8 @@ Make any macOS window look transparent — **without disabling SIP**.
 
 Hover a window's title bar and a slider appears; drag it and the window becomes see-through while staying fully clickable.
 
+**Download page:** https://alexli-77.github.io/Awesome-Desktop-Ghost/
+
 ## How it works
 
 macOS does not let one process change another process's window alpha, and the old injection tricks (Afloat, SIMBL) no longer survive SIP and the hardened runtime.
@@ -31,7 +33,8 @@ How: while a window is hidden, Ghost covers each display with a full-screen capt
 
 **Which sharing tools it works with.** Hiding relies on the capture tool honouring macOS's "don't capture this window" flag, which everything built on ScreenCaptureKit does:
 
-- verified: Chrome's screen sharing (`getDisplayMedia`, what Google Meet, Zoom / Teams / Feishu in the browser use), the macOS screenshot and recording tools (⇧⌘3, ⇧⌘5), Cap;
+- verified: Chrome's screen sharing (`getDisplayMedia`, what Google Meet, Zoom / Teams / Feishu in the browser use) and macOS screenshots (⇧⌘3);
+- expected, same mechanism, not tested one by one: ⇧⌘5 recording, QuickTime, Cap, other Chromium browsers;
 - **not** honoured: Feishu / Lark's desktop screen recorder, which grabs the raw screen — it records exactly what you see, so nothing can be hidden from it. Other native meeting apps may do the same; test before relying on them (share your screen and check what the other side sees).
 
 If Ghost crashes or is force-quit, a watchdog process that keeps opaque blocks under the hidden windows takes over at once and relaunches Ghost, which covers them again.
