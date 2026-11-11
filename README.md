@@ -4,7 +4,7 @@ Make any macOS window look transparent — **without disabling SIP**.
 
 Hover a window's title bar and a slider appears; drag it and the window becomes see-through while staying fully clickable.
 
-**Download page:** https://alexli-77.github.io/Awesome-Desktop-Ghost/
+**Download page:** https://yangli-0409.github.io/Awesome-Desktop-Ghost/
 
 ## How it works
 
@@ -63,7 +63,7 @@ xattr -dr com.apple.quarantine /Applications/Ghost.app
 Requires macOS 13+ and Xcode or the Command Line Tools.
 
 ```bash
-git clone https://github.com/alexli-77/Awesome-Desktop-Ghost.git
+git clone https://github.com/yangli-0409/Awesome-Desktop-Ghost.git
 cd Awesome-Desktop-Ghost
 ./build.sh      # builds Ghost.app and installs it to /Applications
 open /Applications/Ghost.app
