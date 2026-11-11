@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost 共享自测页</title>
+<link rel="icon" type="image/png" href="../favicon.png">
+<style>
+  :root { --ink: #1d1b2e; --muted: #5f5b78; --line: #e6e3f2; --bg: #faf9ff; --accent: #7c6cff; --ok: #1a7f4b; --no: #b42318; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.65 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif; color: var(--ink); background: var(--bg); }
+  a { color: var(--accent); }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 32px 24px 64px; }
+  h1 { font-size: 30px; margin: 0 0 6px; }
+  .lead { color: var(--muted); margin: 0 0 22px; }
+  ol { padding-left: 22px; } li { margin: 6px 0; }
+  kbd { font: 13px ui-monospace, monospace; background: #fff; border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
+  .btns { display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }
+  button { font: 600 16px -apple-system, sans-serif; padding: 10px 20px; border-radius: 10px; border: 1.5px solid var(--accent); background: #fff; color: var(--accent); cursor: pointer; }
+  button.primary { background: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { font-size: 28px; font-weight: 700; margin: 8px 0 2px; color: var(--muted); }
+  #status.ok { color: var(--ok); } #status.bad { color: var(--no); }
+  #detail { color: var(--muted); font-size: 14px; min-height: 1.5em; }
+  video { display: none; width: 100%; max-width: 520px; margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+  video.on { display: block; }
+  .note { font-size: 14px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ghost 共享自测页</h1>
+  <p class="lead">开会前用这个页面看一眼：别人收到的共享画面里，你的半透明窗口是不是真的不见了。全程只在你的浏览器里运行，画面不会上传。</p>
+
+  <ol>
+    <li>点下面的「打开测试窗口」，会弹出一个品红色的小窗口。</li>
+    <li>在菜单栏 👻 里打开「共享/录屏时隐藏」，再点一下品红窗口，按 <kbd>⌃⌥T</kbd> 让它变成半透明。</li>
+    <li>回到这个页面，点「开始共享」，选「整个屏幕」。</li>
+    <li>看结果和下面的预览。预览就是对方看到的画面。</li>
+  </ol>
+
+  <div class="btns">
+    <button id="target">打开测试窗口</button>
+    <button id="start" class="primary">开始共享</button>
+    <button id="stop" disabled>停止</button>
+  </div>
+
+  <div id="status">未开始</div>
+  <div id="detail"></div>
+  <video id="v" autoplay muted playsinline></video>
+
+  <p class="note">也可以不用测试窗口，直接把你要藏的窗口调成半透明，再看预览里有没有它。这个页面调用的是网页会议用的屏幕共享接口，结果和 Meet、Zoom 网页版、飞书网页版一致；桌面会议客户端请用它们自己的共享预览检查。建议用 Chrome 或 Edge。</p>
+  <p class="note"><a href="../">← 返回 Ghost 下载页</a></p>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let stream, timer, frames = 0, seenFrames = 0, warn = '';
+const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+$('target').onclick = () => {
+  const w = window.open('target.html', 'ghost-target', 'popup,width=420,height=320');
+  if (!w) $('detail').textContent = '弹窗被浏览器拦截了，请允许本站弹出窗口后再试。';
+};
+
+$('start').onclick = async () => {
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    $('detail').textContent = '这个浏览器不支持网页屏幕共享，请换 Chrome 或 Edge。';
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: 15, displaySurface: 'monitor' }, audio: false,
+      selfBrowserSurface: 'exclude', monitorTypeSurfaces: 'include' });
+  } catch (e) { $('detail').textContent = '没有开始共享：' + e.message; return; }
+  const track = stream.getVideoTracks()[0];
+  const surface = track.getSettings().displaySurface;
+  warn = surface && surface !== 'monitor' ? '提示：你共享的不是整个屏幕，测试窗口本来就不会出现在画面里。请停止后重新选「整个屏幕」。 ' : '';
+  $('v').srcObject = stream; $('v').classList.add('on');
+  $('start').disabled = true; $('stop').disabled = false;
+  frames = seenFrames = 0;
+  track.onended = stop;
+  timer = setInterval(analyze, 250);
+};
+$('stop').onclick = stop;
+
+function stop() {
+  clearInterval(timer);
+  stream && stream.getTracks().forEach(t => t.stop());
+  $('v').srcObject = null; $('v').classList.remove('on');
+  $('start').disabled = false; $('stop').disabled = true;
+  if (frames) $('detail').textContent = `已停止。共检查 ${frames} 帧，其中 ${seenFrames} 帧能看到测试窗口。`;
+}
+
+// Counts magenta-ish pixels. A half-transparent magenta window still has red and
+// blue well above green, over light or dark backgrounds, so this catches it too.
+function analyze() {
+  const v = $('v');
+  if (!v.videoWidth) return;
+  const w = canvas.width = Math.round(v.videoWidth / 4), h = canvas.height = Math.round(v.videoHeight / 4);
+  ctx.drawImage(v, 0, 0, w, h);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i], g = d[i + 1], b = d[i + 2];
+    if (r - g > 40 && b - g > 40 && Math.abs(r - b) < 50) n++;
+  }
+  // A real window covers far more than 1% of a downscaled frame; stray pink icons don't.
+  const seen = n > w * h * 0.01;
+  frames++;
+  if (seen) seenFrames++;
+  $('status').textContent = seen ? '❌ 对方看得到品红测试窗口' : '✅ 对方看不到品红测试窗口';
+  $('status').className = seen ? 'bad' : 'ok';
+  $('detail').textContent = warn + `已检查 ${frames} 帧，看得到的 ${seenFrames} 帧。没打开测试窗口时，这里一直是 ✅，请以预览为准。`;
+}
+</script>
+</body>
+</html>

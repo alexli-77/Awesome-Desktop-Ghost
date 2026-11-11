@@ -37,6 +37,8 @@ How: while a window is hidden, Ghost covers each display with a full-screen capt
 - expected, same mechanism, not tested one by one: ⇧⌘5 recording, QuickTime, Cap, other Chromium browsers;
 - **not** honoured: Feishu / Lark's desktop screen recorder, which grabs the raw screen — it records exactly what you see, so nothing can be hidden from it. Other native meeting apps may do the same; test before relying on them (share your screen and check what the other side sees).
 
+Self-test page: https://yangli-0409.github.io/Awesome-Desktop-Ghost/test/ opens a magenta test window, starts a browser screen share and tells you whether the shared picture still shows it.
+
 If Ghost crashes or is force-quit, a watchdog process that keeps opaque blocks under the hidden windows takes over at once and relaunches Ghost, which covers them again.
 
 Trade-offs while something is hidden:
