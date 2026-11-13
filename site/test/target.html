@@ -10,6 +10,7 @@
 </style>
 </head>
 <body>
-  <div>Ghost 测试窗口<br><span style="font-size:15px;font-weight:400">点一下这里，按 ⌃⌥T 变半透明</span></div>
+  <div>Ghost 测试窗口<br><span style="font-size:15px;font-weight:400">点一下这里，按 <span id="key">⌃⌥T</span> 变半透明</span></div>
+  <script>if (/Windows/.test(navigator.userAgent)) document.getElementById('key').textContent = 'Ctrl+Alt+T';</script>
 </body>
 </html>
