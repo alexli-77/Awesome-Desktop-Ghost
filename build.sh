@@ -24,20 +24,34 @@ swiftc -O \
   -o "$APP/Contents/MacOS/Ghost" main.swift
 ln -s Ghost "$APP/Contents/MacOS/Ghost Watchdog"   # names the watchdog process
 
-# Ad-hoc sign with a fixed identifier. NOTE: an ad-hoc signature's hash changes
-# on every build, so macOS forgets the old Screen Recording grant. Clear the
-# stale entry so the next launch asks cleanly instead of silently failing.
-codesign --force --identifier com.yangli.ghost --sign - "$APP"
+# Sign with a stable self-signed identity (see sign.sh) so the Screen Recording
+# grant survives rebuilds; fall back to ad-hoc if that can't be set up.
+if ! ./sign.sh "$APP"; then
+  echo "warning: stable signing failed, signing ad-hoc (Screen Recording must be granted again)"
+  codesign --force --identifier com.yangli.ghost --sign - "$APP"
+fi
+DEST=/Applications/Ghost.app
+req() { codesign -d -r- "$1" 2>/dev/null | sed -n 's/^designated => //p'; }
+NEW_REQ=$(req "$APP")
+OLD_REQ=$(req "$DEST" || true)
 pkill -x "Ghost Watchdog" 2>/dev/null || true   # first, so it doesn't react to Ghost quitting
 pkill -x Ghost 2>/dev/null || true
-tccutil reset ScreenCapture com.yangli.ghost >/dev/null 2>&1 || true
+# A grant recorded for another signature would show as on but not work. Clear
+# it only when the signature really changed (first stable build, or ad-hoc).
+if [ "$NEW_REQ" != "$OLD_REQ" ]; then
+  tccutil reset ScreenCapture com.yangli.ghost >/dev/null 2>&1 || true
+  GRANT=1
+fi
 
 # Install, replacing the old copy, so /Applications never runs a stale build.
-DEST=/Applications/Ghost.app
 rm -rf "$DEST"
 ditto "$APP" "$DEST"
 
 echo "Built $APP and installed to $DEST"
 echo "Run:  open $DEST"
-echo "Then: System Settings > Privacy & Security > Screen Recording → turn on Ghost → relaunch."
+if [ -n "${GRANT:-}" ]; then
+  echo "Then: System Settings > Privacy & Security > Screen Recording → turn on Ghost → relaunch."
+else
+  echo "Same signature as the installed copy: the Screen Recording grant is kept."
+fi
 echo "Debug: run $DEST/Contents/MacOS/Ghost from a terminal to see log output."
