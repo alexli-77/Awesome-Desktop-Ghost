@@ -43,7 +43,7 @@ If Ghost crashes or is force-quit, a watchdog process that keeps opaque blocks u
 
 Trade-offs while something is hidden:
 
-- your whole screen is shown through a capture, about one display frame late, and the window server works noticeably harder (≈ half a CPU core on an M-series Mac);
+- your whole screen is shown through a capture, about one display frame late, at 60 fps (30 fps when the Mac runs hot or is in Low Power Mode), and the window server works noticeably harder (≈ half a CPU core on an M-series Mac); on a slow Mac Ghost also tracks windows less often, which only affects how closely the see-through area follows a dragged window, never what shares see;
 - DRM-protected video (Netflix, Apple TV) can't be captured, so it may show black to you as well;
 - quitting Ghost from the menu warns you first: hidden windows reappear in shares once it's gone.
 
