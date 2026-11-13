@@ -310,6 +310,15 @@ final class Ghost: NSObject, SCStreamOutput, SCStreamDelegate {
 
 let shieldLevel = NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 1)
 
+/// Capture rate of both shield streams. 60 is smooth enough for a share and for
+/// your own view; on a hot Mac or in Low Power Mode drop to 30 so the window
+/// server isn't pushed further. Hiding never depends on the rate: the cover
+/// stays up full-screen whatever it shows.
+func shieldFPS() -> Int {
+    let p = ProcessInfo.processInfo
+    return p.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue || p.isLowPowerModeEnabled ? 30 : 60
+}
+
 /// Bounds, on-screen flag and owner pid for one window id; nil once it's closed.
 /// Unlike CGWindowListCopyWindowInfo(.optionIncludingWindow), this also finds
 /// windows that are off screen (minimized, app hidden, other Space).
@@ -355,19 +364,23 @@ func subtract(_ cut: CGRect, from rects: [CGRect]) -> [CGRect] {
     }
 }
 
-/// Windows in front of `id` that hide it from you: other apps' windows, menus,
-/// the Dock and menu bar, and the hidden app's own unrelated windows. Not counted:
-/// `except` (the window and its menus/sheets), Ghost's and the watchdog's windows,
-/// invisible ones, and windows covering a whole display (those are click-through
-/// overlays, like a recorder's frame).
-func occluders(of id: CGWindowID, except: Set<CGWindowID>) -> [CGRect] {
-    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow], id) as? [[String: Any]] else { return [] }
-    let me = ProcessInfo.processInfo.processIdentifier
+/// Bounds of the active displays, CG coordinates.
+func displayBounds() -> [CGRect] {
     var displays = [CGDirectDisplayID](repeating: 0, count: 16)
     var n: UInt32 = 0
     CGGetActiveDisplayList(16, &displays, &n)
-    let screens = displays.prefix(Int(n)).map(CGDisplayBounds)
-    return list.compactMap { d -> CGRect? in
+    return displays.prefix(Int(n)).map(CGDisplayBounds)
+}
+
+/// Of the on-screen windows in front of a window (`front`, from the window list),
+/// those that hide it from you: other apps' windows, menus, the Dock and menu
+/// bar, and the hidden app's own unrelated windows. Not counted: `except` (the
+/// window's menus/sheets), Ghost's and the watchdog's windows, invisible ones,
+/// and windows covering a whole display (click-through overlays, like a
+/// recorder's frame).
+func occluders(in front: ArraySlice<[String: Any]>, except: Set<CGWindowID>, screens: [CGRect]) -> [CGRect] {
+    let me = ProcessInfo.processInfo.processIdentifier
+    return front.compactMap { d -> CGRect? in
         guard let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid != me, pid != watchdogPID,
               let wid = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value, !except.contains(wid),
               let layer = (d[kCGWindowLayer as String] as? NSNumber)?.intValue,
@@ -500,6 +513,15 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
     private var patches: [CGWindowID: CALayer] = [:]
     private let queue = DispatchQueue(label: "ghost.shield", qos: .userInteractive)
     private var stopped = false
+    private var fps = shieldFPS()
+
+    /// Newest frame per stream not yet shown. If the main thread falls behind,
+    /// older frames are dropped instead of queueing up (stale picture, surfaces
+    /// held back from the capture pool).
+    private struct Arrival { var surface: IOSurface?; var shown: UInt64 }
+    private var arrivals: [ObjectIdentifier: Arrival] = [:]       // guarded by arrivalLock
+    private var drainScheduled = false                           // guarded by arrivalLock
+    private let arrivalLock = NSLock()
 
     private(set) var base: ShieldStream!      // keys: pidKey(hidden apps) + their windows to keep
     private(set) var view: ShieldStream!      // keys: none
@@ -563,6 +585,17 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
     func want(_ keys: Set<UInt64>) { base.want(keys) }
     func wantInView(_ keys: Set<UInt64>) { view.want(keys) }
 
+    /// Follow shieldFPS() after a thermal or power change.
+    func updateFPS() {
+        let f = shieldFPS()
+        guard f != fps else { return }
+        fps = f
+        for s in streams.compactMap(\.stream) {
+            let c = config(fps: f)
+            Task { try? await s.updateConfiguration(c) }
+        }
+    }
+
     /// The cover is up and known to leave this app's hidden windows out.
     func isReady(pid: pid_t) -> Bool {
         base.surface != nil && base.confirmed.contains(pidKey(pid))
@@ -598,13 +631,13 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
                 } else { NSLog("Ghost: shield could not find its own windows in shareable content") }
                 return
             }
-            let maxFPS = NSScreen.screens.map(\.maximumFramesPerSecond).max() ?? 60
             var made: [(ShieldStream, SCStream, Set<UInt64>)] = []
-            // Cover: what shares and recordings get, so full rate and resolution.
-            // View: what you see, so the display's own refresh rate.
-            for (ss, fps) in [(base!, 60), (view!, maxFPS)] {
+            // Full resolution for both; the rate follows shieldFPS(). The view isn't
+            // run at a 120 Hz display's full rate: barely smoother, much more work.
+            let rate = await MainActor.run { fps }
+            for ss in [base!, view!] {
                 let keys = await MainActor.run { ss.startKeys }
-                let s = SCStream(filter: ss.makeFilter(content, keys), configuration: config(fps: fps), delegate: self)
+                let s = SCStream(filter: ss.makeFilter(content, keys), configuration: config(fps: rate), delegate: self)
                 try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
                 made.append((ss, s, keys))
             }
@@ -713,11 +746,30 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
         if status == .complete, let pb = CMSampleBufferGetImageBuffer(sb) {
             surface = CVPixelBufferGetIOSurface(pb)?.takeUnretainedValue()
         }
-        DispatchQueue.main.async { [weak self] in self?.frameArrived(stream, surface: surface, shown: shown) }
+        let key = ObjectIdentifier(stream)
+        arrivalLock.lock()
+        var a = arrivals[key] ?? Arrival(surface: nil, shown: 0)
+        if let surface { a.surface = surface }        // an idle frame keeps the pending picture
+        a.shown = max(a.shown, shown)
+        arrivals[key] = a
+        let schedule = !drainScheduled
+        drainScheduled = true
+        arrivalLock.unlock()
+        if schedule { DispatchQueue.main.async { [weak self] in self?.drainArrivals() } }
     }
 
-    private func frameArrived(_ s: SCStream, surface: IOSurface?, shown: UInt64) {
-        guard let ss = streams.first(where: { $0.stream === s }) else { return }
+    private func drainArrivals() {
+        arrivalLock.lock()
+        let pending = arrivals
+        arrivals.removeAll()
+        drainScheduled = false
+        arrivalLock.unlock()
+        for ss in streams {
+            if let s = ss.stream, let a = pending[ObjectIdentifier(s)] { frameArrived(ss, surface: a.surface, shown: a.shown) }
+        }
+    }
+
+    private func frameArrived(_ ss: ShieldStream, surface: IOSurface?, shown: UInt64) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         if let surface {
@@ -839,6 +891,7 @@ final class ShareShield {
     private var shields: [CGDirectDisplayID: DisplayShield] = [:]
     let cursor = CursorCloak()
     private var timer: Timer?
+    private var powerObservers: [NSObjectProtocol] = []
     private var syncing = false
     private var resyncNeeded = false
     private var reportedActive: Set<CGWindowID> = []
@@ -905,18 +958,70 @@ final class ShareShield {
 
     private func start() {
         guard timer == nil else { return }
-        let t = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in self?.tick() }
-        RunLoop.main.add(t, forMode: .common)         // keep running during menu tracking / drags
-        timer = t
+        tickHz = tickCeiling
+        busy = 0
+        busySince = CACurrentMediaTime()
+        schedule()
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.syncDisplays() }
+        powerObservers = [ProcessInfo.thermalStateDidChangeNotification, .NSProcessInfoPowerStateDidChange].map {
+            NotificationCenter.default.addObserver(forName: $0, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.shields.values.forEach { $0.updateFPS() }
+                if self.tickHz > self.tickCeiling { self.tickHz = self.tickCeiling; self.schedule() }
+            }
+        }
         syncDisplays()
+    }
+
+    private func schedule() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: 1.0 / tickHz, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)         // keep running during menu tracking / drags
+        timer = t
+    }
+
+    // Tick rate. 120 Hz keeps the hole on a dragged window, but a tick blocks the
+    // main thread (menus, the slider and frames all live there) mostly waiting on
+    // the window server, which is slow on a slow or busy Mac. So the rate follows
+    // how much of the main thread ticks take: over half → step down; under 30% →
+    // after a while try a step up, and if that doesn't hold, wait longer before
+    // trying again. A slower tick never uncovers anything: the cover doesn't
+    // depend on it.
+    private(set) var tickHz: Double = 120
+    private var tickCeiling: Double { shieldFPS() < 60 ? 60 : 120 }
+    private var busy: Double = 0                      // seconds spent in ticks since busySince
+    private var busySince = CACurrentMediaTime()
+    private var lastChange = Date()
+    private var steppedUpAt: Date?
+    private var probeWait: TimeInterval = 2
+    private(set) var load: Double = 0                 // share of the main thread, last window
+    private var lastScan = Date.distantPast
+
+    private func retune(load: Double) {
+        let now = Date()
+        var hz = min(tickHz, tickCeiling)
+        if load > 0.5, hz > 30 {
+            hz /= 2
+            if let up = steppedUpAt, now.timeIntervalSince(up) < 2 { probeWait = min(probeWait * 2, 60) }
+            steppedUpAt = nil
+        } else if load < 0.3, hz < tickCeiling, now.timeIntervalSince(lastChange) > probeWait {
+            hz *= 2
+            steppedUpAt = now
+        }
+        if let up = steppedUpAt, now.timeIntervalSince(up) > 10 { probeWait = 2; steppedUpAt = nil }   // it held
+        guard hz != tickHz else { return }
+        tickHz = hz
+        lastChange = now
+        if timer != nil { schedule() }
     }
 
     private func stop() {
         timer?.invalidate()
         timer = nil
+        powerObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        powerObservers = []
         cursor.stop()
         if let o = screenObserver { NotificationCenter.default.removeObserver(o) }
         screenObserver = nil
@@ -977,7 +1082,6 @@ final class ShareShield {
         }
     }
 
-    private var tickCount = 0
     /// Per hidden window, the same-app windows that belong to it (last full scan).
     private var related: [CGWindowID: Set<CGWindowID>] = [:]
     /// Every on-screen window of a hidden app → the hidden window it belongs to (nil: unrelated).
@@ -994,17 +1098,43 @@ final class ShareShield {
         }
     }
 
-    /// 120 Hz: follow the hidden windows and their children, looked up by id.
+    /// Up to 120 Hz: follow the hidden windows and their children, looked up by id.
     private func tick() {
-        tickCount += 1
-        if tickCount % 8 == 1 { scan() }
-        let ids = Array(targets.keys) + related.values.flatMap { $0 }
-        let info = describeWindows(ids)
+        let began = CACurrentMediaTime()
+        defer {
+            let now = CACurrentMediaTime()
+            busy += now - began
+            if now - busySince >= 0.5 {
+                load = busy / (now - busySince)
+                busy = 0
+                busySince = now
+                retune(load: load)
+            }
+        }
+        // One window-list call per tick serves everything: positions, stacking
+        // order and the windows in front. Only windows missing from it (minimized,
+        // hidden, other Space, closed) are looked up one by one.
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        if Date().timeIntervalSince(lastScan) >= 1.0 / 15 {
+            lastScan = Date()
+            scan(list)
+        }
+        var onScreen: [CGWindowID: (bounds: CGRect, z: Int)] = [:]
+        for (z, d) in list.enumerated() {
+            guard let id = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let bd = d[kCGWindowBounds as String] as? NSDictionary,
+                  let b = CGRect(dictionaryRepresentation: bd as CFDictionary) else { continue }
+            onScreen[id] = (b, z)
+        }
+        let offScreen = describeWindows(targets.keys.filter { onScreen[$0] == nil })
+        let screens = displayBounds()
         var gone: [CGWindowID] = []
         for (id, var t) in targets {
-            guard let w = info[id] else { gone.append(id); continue }   // closed
-            t.onScreen = w.onScreen
-            guard w.onScreen else { targets[id] = t; continue }      // off screen: keep the hole where it was
+            guard let w = onScreen[id] else {
+                if offScreen[id] == nil { gone.append(id) } else { t.onScreen = false; targets[id] = t }   // closed / off screen:
+                continue                                                                               // keep the hole where it was
+            }
+            t.onScreen = true
             let b = w.bounds
             let step = max(abs(b.minX - t.bounds.minX), abs(b.minY - t.bounds.minY),
                            abs(b.maxX - t.bounds.maxX), abs(b.maxY - t.bounds.maxY))
@@ -1012,11 +1142,11 @@ final class ShareShield {
             t.bounds = b
             var group = b
             for oid in related[id] ?? [] {
-                if let o = info[oid], o.onScreen, o.bounds.intersects(b) { group = group.union(o.bounds) }
+                if let o = onScreen[oid], o.bounds.intersects(b) { group = group.union(o.bounds) }
             }
             t.group = group
             t.rect = group.insetBy(dx: -t.pad, dy: -t.pad)
-            let front = occluders(of: id, except: (related[id] ?? []).union([id]))
+            let front = occluders(in: list[..<w.z], except: related[id] ?? [], screens: screens)
             t.visible = front.reduce([t.rect]) { subtract($1, from: $0) }
             t.exposed = front.reduce([group]) { subtract($1, from: $0) }
             targets[id] = t
@@ -1028,8 +1158,8 @@ final class ShareShield {
     /// 15 Hz: sort the hidden apps' other windows into "belongs to a hidden window"
     /// (left out of shares with it) and "unrelated" (shown in shares). A window
     /// that appears in between is unknown, and unknown windows stay left out.
-    private func scan() {
-        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return }
+    private func scan(_ given: [[String: Any]]? = nil) {
+        guard let list = given ?? CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return }
         var wins: [CGWindowID: (pid: pid_t, layer: Int, bounds: CGRect, z: Int, titled: Bool)] = [:]
         let watched = pids
         let me = ProcessInfo.processInfo.processIdentifier
