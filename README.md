@@ -71,7 +71,7 @@ cd Awesome-Desktop-Ghost
 open /Applications/Ghost.app
 ```
 
-`build.sh` also resets the stale Screen Recording grant (`tccutil reset ScreenCapture com.yangli.ghost`), because an ad-hoc signature changes on every build and macOS forgets the previous permission.
+`build.sh` signs with a self-signed certificate that `sign.sh` creates on the first build (kept in its own keychain, `~/Library/Keychains/ghost-signing.keychain-db`). macOS ties the Screen Recording grant to the signature's requirement, which stays the same across builds signed with the same certificate, so you grant it once and later builds keep it. Only when the requirement changes (the first build after switching from ad-hoc, or an ad-hoc fallback) does `build.sh` clear the stale grant so the next launch asks again. Any program running as you can use that certificate too, and so could sign itself as Ghost and inherit the grant; delete the keychain to revoke it.
 
 ## Limitations
 
