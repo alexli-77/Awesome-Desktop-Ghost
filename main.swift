@@ -341,6 +341,46 @@ func describeWindows(_ ids: [CGWindowID]) -> [CGWindowID: (bounds: CGRect, onScr
     return out
 }
 
+/// The parts of `rects` outside `cut`.
+func subtract(_ cut: CGRect, from rects: [CGRect]) -> [CGRect] {
+    rects.flatMap { r -> [CGRect] in
+        let i = r.intersection(cut)
+        guard !i.isNull, !i.isEmpty else { return [r] }
+        var out: [CGRect] = []
+        if i.minY > r.minY { out.append(CGRect(x: r.minX, y: r.minY, width: r.width, height: i.minY - r.minY)) }
+        if i.maxY < r.maxY { out.append(CGRect(x: r.minX, y: i.maxY, width: r.width, height: r.maxY - i.maxY)) }
+        if i.minX > r.minX { out.append(CGRect(x: r.minX, y: i.minY, width: i.minX - r.minX, height: i.height)) }
+        if i.maxX < r.maxX { out.append(CGRect(x: i.maxX, y: i.minY, width: r.maxX - i.maxX, height: i.height)) }
+        return out
+    }
+}
+
+/// Windows in front of `id` that hide it from you: other apps' windows, menus,
+/// the Dock and menu bar, and the hidden app's own unrelated windows. Not counted:
+/// `except` (the window and its menus/sheets), Ghost's and the watchdog's windows,
+/// invisible ones, and windows covering a whole display (those are click-through
+/// overlays, like a recorder's frame).
+func occluders(of id: CGWindowID, except: Set<CGWindowID>) -> [CGRect] {
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow], id) as? [[String: Any]] else { return [] }
+    let me = ProcessInfo.processInfo.processIdentifier
+    var displays = [CGDirectDisplayID](repeating: 0, count: 16)
+    var n: UInt32 = 0
+    CGGetActiveDisplayList(16, &displays, &n)
+    let screens = displays.prefix(Int(n)).map(CGDisplayBounds)
+    return list.compactMap { d -> CGRect? in
+        guard let pid = (d[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value, pid != me, pid != watchdogPID,
+              let wid = (d[kCGWindowNumber as String] as? NSNumber)?.uint32Value, !except.contains(wid),
+              let layer = (d[kCGWindowLayer as String] as? NSNumber)?.intValue,
+              (0...Int(CGWindowLevelForKey(.statusWindow))).contains(layer) || layer == Int(CGWindowLevelForKey(.popUpMenuWindow)),
+              (d[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1 > 0.05,
+              let bd = d[kCGWindowBounds as String] as? NSDictionary,
+              let b = CGRect(dictionaryRepresentation: bd as CFDictionary),
+              !screens.contains(where: { b.contains($0) })
+        else { return nil }
+        return b
+    }
+}
+
 private func makeOverlay(frame: NSRect, level: NSWindow.Level, sharing: NSWindow.SharingType) -> (NSWindow, CALayer) {
     let w = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
     w.isOpaque = false
@@ -442,7 +482,8 @@ func pidKey(_ pid: pid_t) -> UInt64 { 1 << 40 | UInt64(UInt32(bitPattern: pid)) 
 ///     with a hole at each hidden window; inside the hole the real screen at the
 ///     chosen opacity over the cover: α·window + (1−α)·what's behind it.
 final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
-    struct Patch { let id: CGWindowID; let pid: pid_t; let rect: CGRect; let alpha: CGFloat }
+    /// `visible`: the parts of `rect` not covered by windows in front (CG coordinates).
+    struct Patch { let id: CGWindowID; let pid: pid_t; let rect: CGRect; let visible: [CGRect]; let alpha: CGFloat }
 
     let display: SCDisplay
     var frame: CGRect { display.frame }
@@ -598,6 +639,7 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
         for (id, l) in patches where !live.contains(id) {
             l.removeFromSuperlayer()
             patches[id] = nil
+            patchPieces[id] = nil
         }
         let d = display.frame
         var holes: [CGRect] = []
@@ -606,12 +648,31 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
             let x = p.rect.minX - d.minX, y = d.maxY - p.rect.maxY
             let r = CGRect(x: x, y: y, width: p.rect.width, height: p.rect.height)
             let cr = CGRect(x: x / d.width, y: y / d.height, width: p.rect.width / d.width, height: p.rect.height / d.height)
-            let show = isReady(pid: p.pid) && view.surface != nil && p.rect.intersects(d)
+            // Blend only where the window is in sight. Where another window is in
+            // front, you see the real screen: blending two captures taken at
+            // different moments there would smear anything that moves.
+            let pieces = p.visible.map { $0.intersection(d) }.filter { !$0.isNull && !$0.isEmpty }
+            let show = isReady(pid: p.pid) && view.surface != nil && !pieces.isEmpty
             if l.frame != r { l.frame = r }
             if l.contentsRect != cr { l.contentsRect = cr }
             if l.isHidden == show { l.isHidden = !show }
             if l.opacity != Float(p.alpha) { l.opacity = Float(p.alpha) }
-            if show { holes.append(r) }
+            if show {
+                let local = pieces.map { CGRect(x: $0.minX - p.rect.minX, y: p.rect.maxY - $0.maxY, width: $0.width, height: $0.height) }
+                let mask = l.mask as! CAShapeLayer
+                if mask.frame.size != r.size { mask.frame = CGRect(origin: .zero, size: r.size) }
+                if local != patchPieces[p.id] {
+                    patchPieces[p.id] = local
+                    let path = CGMutablePath()
+                    local.forEach { path.addRect($0) }
+                    mask.path = path
+                }
+                // Even-odd needs holes that don't overlap (two hidden windows can).
+                for v in pieces {
+                    let h = CGRect(x: v.minX - d.minX, y: d.maxY - v.maxY, width: v.width, height: v.height)
+                    holes += holes.reduce([h]) { subtract($1, from: $0) }
+                }
+            }
         }
         if holes != lastHoles {
             lastHoles = holes
@@ -622,12 +683,17 @@ final class DisplayShield: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    private var patchPieces: [CGWindowID: [CGRect]] = [:]
+
     private func addPatch(_ id: CGWindowID) -> CALayer {
         let l = CALayer()
         l.contentsGravity = .resize
         l.isHidden = true
         l.contents = view.surface
         l.actions = quietActions
+        let mask = CAShapeLayer()
+        mask.actions = ["path": NSNull(), "bounds": NSNull(), "position": NSNull()]
+        l.mask = mask
         viewRoot.addSublayer(l)
         patches[id] = l
         return l
@@ -763,6 +829,8 @@ final class ShareShield {
         var bounds: CGRect
         var group: CGRect          // the window plus its menus/popovers/sheets
         var rect: CGRect           // group, padded: the hole in the local view
+        var visible: [CGRect]      // the parts of rect no other window is in front of
+        var exposed: [CGRect]      // the parts of group no other window is in front of
         var pad: CGFloat
         var onScreen = true
     }
@@ -809,8 +877,9 @@ final class ShareShield {
         }
         guard let info = windowInfo(id) else { return false }
         let pad = basePad
+        let rect = info.bounds.insetBy(dx: -pad, dy: -pad)
         targets[id] = Target(pid: info.pid, alpha: alpha, bounds: info.bounds, group: info.bounds,
-                             rect: info.bounds.insetBy(dx: -pad, dy: -pad), pad: pad)
+                             rect: rect, visible: [rect], exposed: [info.bounds], pad: pad)
         start()
         shields.values.forEach { $0.want(keys) }
         onTargetsChanged?()
@@ -947,6 +1016,9 @@ final class ShareShield {
             }
             t.group = group
             t.rect = group.insetBy(dx: -t.pad, dy: -t.pad)
+            let front = occluders(of: id, except: (related[id] ?? []).union([id]))
+            t.visible = front.reduce([t.rect]) { subtract($1, from: $0) }
+            t.exposed = front.reduce([group]) { subtract($1, from: $0) }
             targets[id] = t
         }
         gone.forEach(remove)
@@ -1010,13 +1082,14 @@ final class ShareShield {
     }
 
     private func layoutAll() {
-        let patches = targets.map { DisplayShield.Patch(id: $0.key, pid: $0.value.pid, rect: $0.value.rect, alpha: $0.value.alpha) }
+        let patches = targets.map { DisplayShield.Patch(id: $0.key, pid: $0.value.pid, rect: $0.value.rect,
+                                                        visible: $0.value.visible, alpha: $0.value.alpha) }
         for s in shields.values {
             s.checkIdle()
             s.layout(patches)
         }
         cursor.update(hiddenOver: targets.filter { $0.value.onScreen && isActive($0.key) }
-                                         .map { $0.value.group.insetBy(dx: -6, dy: -6) })
+                                         .flatMap { $0.value.exposed.map { $0.insetBy(dx: -6, dy: -6) } })
         for id in targets.keys where !reportedActive.contains(id) && isActive(id) {
             reportedActive.insert(id)
             onActive?(id, targets[id]!.pid)
