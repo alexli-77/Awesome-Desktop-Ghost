@@ -116,6 +116,7 @@ The Windows code so far is **CI-verified to compile only**. The behaviours below
 - Modifying another window's styles fails for UIPI-protected (elevated) or UWP/Store windows; Ghost reports this instead of failing silently.
 - The title-bar hover region is approximated as the top ~42 px of a window, so apps with tall custom title bars may trigger the slider imprecisely.
 - Feishu/Lark's desktop recorder ignores capture-exclusion on macOS; the same is expected on Windows and is untested.
+- To check hiding before a meeting, the same [self-test page](https://yangli-0409.github.io/Awesome-Desktop-Ghost/test/) works on Windows (it shows the Windows tray and Ctrl+Alt+T steps there). If hiding the browser's test popup fails, ghost an ordinary window such as Notepad and check the preview instead.
 
 ## License
 

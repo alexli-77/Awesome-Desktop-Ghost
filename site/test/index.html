@@ -34,7 +34,7 @@
 
   <ol>
     <li>点下面的「打开测试窗口」，会弹出一个品红色的小窗口。</li>
-    <li>在菜单栏 👻 里打开「共享/录屏时隐藏」，再点一下品红窗口，按 <kbd>⌃⌥T</kbd> 让它变成半透明。</li>
+    <li id="step2">在菜单栏 👻 里打开「共享/录屏时隐藏」，再点一下品红窗口，按 <kbd>⌃⌥T</kbd> 让它变成半透明。</li>
     <li>回到这个页面，点「开始共享」，选「整个屏幕」。</li>
     <li>看结果和下面的预览。预览就是对方看到的画面。</li>
   </ol>
@@ -50,11 +50,16 @@
   <video id="v" autoplay muted playsinline></video>
 
   <p class="note">也可以不用测试窗口，直接把你要藏的窗口调成半透明，再看预览里有没有它。这个页面调用的是网页会议用的屏幕共享接口，结果和 Meet、Zoom 网页版、飞书网页版一致；桌面会议客户端请用它们自己的共享预览检查。建议用 Chrome 或 Edge。</p>
+  <p class="note" id="winNote" hidden>Windows 版（Beta）要往目标程序里注入一个小 DLL 才能隐藏窗口。如果对浏览器弹出的测试窗口隐藏时报错，换一个普通窗口（比如记事本）调成半透明，再看预览里有没有它。</p>
   <p class="note"><a href="../">← 返回 Ghost 下载页</a></p>
 </div>
 <script>
 const $ = id => document.getElementById(id);
 let stream, timer, frames = 0, seenFrames = 0, warn = '';
+if (/Windows/.test(navigator.userAgent)) {
+  $('step2').innerHTML = '右键任务栏托盘里的 Ghost 图标（可能收在 <kbd>^</kbd> 里），打开「共享/录屏时隐藏」，再点一下品红窗口，按 <kbd>Ctrl+Alt+T</kbd> 让它变成半透明。';
+  $('winNote').hidden = false;
+}
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 

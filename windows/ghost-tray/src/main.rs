@@ -348,9 +348,10 @@ pub fn set_opacity(hwnd: isize, pid: u32, percent: u8) {
     match win::set_alpha(hwnd, percent) {
         Ok(added) => {
             let hide = with_app(|a| a.hide_in_shares);
-            with_app(|a| {
+            let is_new = with_app(|a| {
                 if let Some(g) = a.ghosts.iter_mut().find(|g| g.hwnd == hwnd) {
                     g.percent = percent;
+                    false
                 } else {
                     a.ghosts.push(Ghost {
                         hwnd,
@@ -359,9 +360,13 @@ pub fn set_opacity(hwnd: isize, pid: u32, percent: u8) {
                         added_layered: added,
                         hidden: false,
                     });
+                    true
                 }
             });
-            if hide {
+            // Inject only when a window is first ghosted. The HUD calls this on
+            // every mouse move while dragging; injecting each time would block
+            // the UI thread (up to 5 s per call) and repeat any error box.
+            if hide && is_new {
                 apply_hide(hwnd, pid, true);
             }
         }
